@@ -389,6 +389,7 @@ impl ChainSync {
 							// Part of the forked chain. Restart to find common block again
 							debug!(target: "sync", "Mismatched block header {} {}, restarting sync", number, hash);
 							self.restart(io);
+							self.continue_sync(io);
 							return Ok(());
 						}
 						if self.headers.find_item(&(number - 1)).map_or(false, |p| p.hash != info.parent_hash) {
@@ -406,6 +407,7 @@ impl ChainSync {
 							// unkown header 
 							debug!(target: "sync", "Old block header {:?} ({}) is unknown, restarting sync", hash, number);
 							self.restart(io);
+							self.continue_sync(io);
 							return Ok(());
 						}
 					}
@@ -839,6 +841,7 @@ impl ChainSync {
 
 		if restart {
 			self.restart(io);
+			self.continue_sync(io);
 			return;
 		}
 
