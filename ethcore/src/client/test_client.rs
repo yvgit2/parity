@@ -16,19 +16,23 @@
 
 //! Test client.
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrder};
 use util::*;
 use transaction::{Transaction, LocalizedTransaction, SignedTransaction, Action};
 use blockchain::TreeRoute;
-use client::{BlockChainClient, BlockChainInfo, BlockStatus, BlockId, TransactionId};
+use client::{BlockChainClient, BlockChainInfo, BlockStatus, BlockId, TransactionId, UncleId};
 use header::{Header as BlockHeader, BlockNumber};
 use filter::Filter;
 use log_entry::LocalizedLogEntry;
-use receipt::Receipt;
+use receipt::{Receipt, LocalizedReceipt};
 use extras::BlockReceipts;
 use error::{ImportResult};
 
 use block_queue::BlockQueueInfo;
-use block::{SealedBlock, ClosedBlock};
+use block::{SealedBlock, ClosedBlock, LockedBlock};
+use executive::Executed;
+use error::Error;
+use engine::Engine;
 
 /// Test client.
 pub struct TestBlockChainClient {
@@ -48,6 +52,12 @@ pub struct TestBlockChainClient {
 	pub storage: RwLock<HashMap<(Address, H256), H256>>,
 	/// Code.
 	pub code: RwLock<HashMap<Address, Bytes>>,
+	/// Execution result.
+	pub execution_result: RwLock<Option<Executed>>,
+	/// Transaction receipts.
+	pub receipts: RwLock<HashMap<TransactionId, LocalizedReceipt>>,
+	/// Block queue size.
+	pub queue_size: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -82,10 +92,23 @@ impl TestBlockChainClient {
 			balances: RwLock::new(HashMap::new()),
 			storage: RwLock::new(HashMap::new()),
 			code: RwLock::new(HashMap::new()),
+			execution_result: RwLock::new(None),
+			receipts: RwLock::new(HashMap::new()),
+			queue_size: AtomicUsize::new(0),
 		};
 		client.add_blocks(1, EachBlockWith::Nothing); // add genesis block
 		client.genesis_hash = client.last_hash.read().unwrap().clone();
 		client
+	}
+
+	/// Set the transaction receipt result
+	pub fn set_transaction_receipt(&self, id: TransactionId, receipt: LocalizedReceipt) {
+		self.receipts.write().unwrap().insert(id, receipt);
+	}
+
+	/// Set the execution result.
+	pub fn set_execution_result(&self, result: Executed) {
+		*self.execution_result.write().unwrap() = Some(result);
 	}
 
 	/// Set the balance of account `address` to `balance`.
@@ -101,6 +124,11 @@ impl TestBlockChainClient {
 	/// Set storage `position` to `value` for account `address`.
 	pub fn set_storage(&self, address: Address, position: H256, value: H256) {
 		self.storage.write().unwrap().insert((address, position), value);
+	}
+
+	/// Set block queue size for testing
+	pub fn set_queue_size(&self, size: usize) {
+		self.queue_size.store(size, AtomicOrder::Relaxed);
 	}
 
 	/// Add blocks to test client.
@@ -182,6 +210,10 @@ impl TestBlockChainClient {
 }
 
 impl BlockChainClient for TestBlockChainClient {
+	fn call(&self, _t: &SignedTransaction) -> Result<Executed, Error> {
+		Ok(self.execution_result.read().unwrap().clone().unwrap())
+	}
+
 	fn block_total_difficulty(&self, _id: BlockId) -> Option<U256> {
 		Some(U256::zero())
 	}
@@ -210,6 +242,14 @@ impl BlockChainClient for TestBlockChainClient {
 		unimplemented!();
 	}
 
+	fn uncle(&self, _id: UncleId) -> Option<BlockHeader> {
+		unimplemented!();
+	}
+
+	fn transaction_receipt(&self, id: TransactionId) -> Option<LocalizedReceipt> {
+		self.receipts.read().unwrap().get(&id).cloned()
+	}
+
 	fn blocks_with_bloom(&self, _bloom: &H2048, _from_block: BlockId, _to_block: BlockId) -> Option<Vec<BlockNumber>> {
 		unimplemented!();
 	}
@@ -218,12 +258,12 @@ impl BlockChainClient for TestBlockChainClient {
 		unimplemented!();
 	}
 
-	fn prepare_sealing(&self, _author: Address, _gas_floor_target: U256, _extra_data: Bytes, _transactions: Vec<SignedTransaction>) -> Option<(ClosedBlock, HashSet<H256>)> {
-		unimplemented!()
+	fn prepare_sealing(&self, _author: Address, _gas_floor_target: U256, _extra_data: Bytes, _transactions: Vec<SignedTransaction>) -> (Option<ClosedBlock>, HashSet<H256>) {
+		(None, HashSet::new())
 	}
 
-	fn try_seal(&self, _block: ClosedBlock, _seal: Vec<Bytes>) -> Result<SealedBlock, ClosedBlock> {
-		unimplemented!()
+	fn try_seal(&self, block: LockedBlock, _seal: Vec<Bytes>) -> Result<SealedBlock, LockedBlock> {
+		Err(block)
 	}
 
 	fn block_header(&self, id: BlockId) -> Option<Bytes> {
@@ -353,7 +393,7 @@ impl BlockChainClient for TestBlockChainClient {
 
 	fn queue_info(&self) -> BlockQueueInfo {
 		BlockQueueInfo {
-			verified_queue_size: 0,
+			verified_queue_size: self.queue_size.load(AtomicOrder::Relaxed),
 			unverified_queue_size: 0,
 			verifying_queue_size: 0,
 			max_queue_size: 0,
@@ -373,5 +413,9 @@ impl BlockChainClient for TestBlockChainClient {
 			best_block_hash: self.last_hash.read().unwrap().clone(),
 			best_block_number: self.blocks.read().unwrap().len() as BlockNumber - 1,
 		}
+	}
+
+	fn engine(&self) -> &Engine {
+		unimplemented!();
 	}
 }

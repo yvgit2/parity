@@ -54,6 +54,9 @@ impl Default for BlockChainConfig {
 
 /// Interface for querying blocks by hash and by number.
 pub trait BlockProvider {
+	/// True if we store full tracing information for transactions.
+	fn have_tracing(&self) -> bool;
+
 	/// Returns true if the given block is known
 	/// (though not necessarily a part of the canon chain).
 	fn is_known(&self, hash: &H256) -> bool;
@@ -98,6 +101,11 @@ pub trait BlockProvider {
 	/// Get transaction with given transaction hash.
 	fn transaction(&self, address: &TransactionAddress) -> Option<LocalizedTransaction> {
 		self.block(&address.block_hash).and_then(|bytes| BlockView::new(&bytes).localized_transaction_at(address.index))
+	}
+
+	/// Get transaction receipt.
+	fn transaction_receipt(&self, address: &TransactionAddress) -> Option<Receipt> {
+		self.block_receipts(&address.block_hash).and_then(|br| br.receipts.into_iter().nth(address.index))
 	}
 
 	/// Get a list of transactions for a given block.
@@ -176,6 +184,9 @@ impl BlockProvider for BlockChain {
 	fn is_known(&self, hash: &H256) -> bool {
 		self.query_extras_exist(hash, &self.block_details)
 	}
+
+	// We do not store tracing information.
+	fn have_tracing(&self) -> bool { false }
 
 	/// Get raw block data
 	fn block(&self, hash: &H256) -> Option<Bytes> {

@@ -18,6 +18,8 @@
 
 use util::*;
 use basic_types::LogBloom;
+use header::BlockNumber;
+use ethjson;
 
 /// A record of execution for a `LOG` operation.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -64,6 +66,16 @@ impl LogEntry {
 	}
 }
 
+impl From<ethjson::state::Log> for LogEntry {
+	fn from(l: ethjson::state::Log) -> Self {
+		LogEntry {
+			address: l.address.into(),
+			topics: l.topics.into_iter().map(Into::into).collect(),
+			data: l.data.into(),
+		}
+	}
+}
+
 impl FromJson for LogEntry {
 	/// Convert given JSON object to a LogEntry.
 	fn from_json(json: &Json) -> LogEntry {
@@ -77,14 +89,14 @@ impl FromJson for LogEntry {
 }
 
 /// Log localized in a blockchain.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct LocalizedLogEntry {
 	/// Plain log entry.
 	pub entry: LogEntry,
 	/// Block in which this log was created.
 	pub block_hash: H256,
 	/// Block number.
-	pub block_number: usize,
+	pub block_number: BlockNumber,
 	/// Hash of transaction in which this log was created.
 	pub transaction_hash: H256,
 	/// Index of transaction within block.

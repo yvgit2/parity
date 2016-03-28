@@ -17,17 +17,27 @@
 //! Blockchain test deserializer.
 
 use std::collections::BTreeMap;
-use std::ops::Deref;
+use std::io::Read;
+use serde_json;
+use serde_json::Error;
 use blockchain::blockchain::BlockChain;
 
 /// Blockchain test deserializer.
 #[derive(Debug, PartialEq, Deserialize)]
 pub struct Test(BTreeMap<String, BlockChain>);
 
-impl Deref for Test {
-	type Target = BTreeMap<String, BlockChain>;
+impl IntoIterator for Test {
+	type Item = <BTreeMap<String, BlockChain> as IntoIterator>::Item;
+	type IntoIter = <BTreeMap<String, BlockChain> as IntoIterator>::IntoIter;
 
-	fn deref(&self) -> &Self::Target {
-		&self.0
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.into_iter()
+	}
+}
+
+impl Test {
+	/// Loads test from json.
+	pub fn load<R>(reader: R) -> Result<Self, Error> where R: Read {
+		serde_json::from_reader(reader)
 	}
 }

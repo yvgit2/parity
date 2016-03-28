@@ -57,16 +57,6 @@ impl Ethash {
 			u256_params: RwLock::new(HashMap::new())
 		}
 	}
-
-	fn u64_param(&self, name: &str) -> u64 {
-		*self.u64_params.write().unwrap().entry(name.to_owned()).or_insert_with(||
-			self.spec().engine_params.get(name).map_or(0u64, |a| decode(&a)))
-	}
-
-	fn u256_param(&self, name: &str) -> U256 {
-		*self.u256_params.write().unwrap().entry(name.to_owned()).or_insert_with(||
-			self.spec().engine_params.get(name).map_or(x!(0), |a| decode(&a)))
-	}
 }
 
 impl Engine for Ethash {
@@ -111,7 +101,7 @@ impl Engine for Ethash {
 	/// This assumes that all uncles are valid uncles (i.e. of at least one generation before the current).
 	fn on_close_block(&self, block: &mut ExecutedBlock) {
 		let reward = self.spec().engine_params.get("blockReward").map_or(U256::from(0u64), |a| decode(&a));
-		let fields = block.fields();
+		let fields = block.fields_mut();
 
 		// Bestow block reward
 		fields.state.add_balance(&fields.header.author, &(reward + reward / U256::from(32) * U256::from(fields.uncles.len())));
@@ -199,6 +189,16 @@ impl Engine for Ethash {
 	fn verify_transaction(&self, t: &SignedTransaction, _header: &Header) -> Result<(), Error> {
 		t.sender().map(|_|()) // Perform EC recovery and cache sender
 	}
+
+	fn u64_param(&self, name: &str) -> u64 {
+		*self.u64_params.write().unwrap().entry(name.to_owned()).or_insert_with(||
+			self.spec().engine_params.get(name).map_or(0u64, |a| decode(&a)))
+	}
+
+	fn u256_param(&self, name: &str) -> U256 {
+		*self.u256_params.write().unwrap().entry(name.to_owned()).or_insert_with(||
+			self.spec().engine_params.get(name).map_or(x!(0), |a| decode(&a)))
+	}
 }
 
 #[cfg_attr(feature="dev", allow(wrong_self_convention))] // to_ethash should take self
@@ -249,11 +249,6 @@ impl Ethash {
 		x!(U256::from((U512::one() << 256) / x!(difficulty)))
 	}
 
-	/// Given the `block_number`, determine the seed hash for Ethash.
-	pub fn get_seedhash(number: BlockNumber) -> H256 {
-		Self::from_ethash(ethash::get_seedhash(number))
-	}
-
 	fn to_ethash(hash: H256) -> EH256 {
 		unsafe { mem::transmute(hash) }
 	}
@@ -299,7 +294,7 @@ mod tests {
 		let mut db = db_result.take();
 		engine.spec().ensure_db_good(db.as_hashdb_mut());
 		let last_hashes = vec![genesis_header.hash()];
-		let b = OpenBlock::new(engine.deref(), db, &genesis_header, last_hashes, Address::zero(), x!(3141562), vec![]);
+		let b = OpenBlock::new(engine.deref(), false, db, &genesis_header, last_hashes, Address::zero(), x!(3141562), vec![]);
 		let b = b.close();
 		assert_eq!(b.state().balance(&Address::zero()), U256::from_str("4563918244f40000").unwrap());
 	}
@@ -312,7 +307,7 @@ mod tests {
 		let mut db = db_result.take();
 		engine.spec().ensure_db_good(db.as_hashdb_mut());
 		let last_hashes = vec![genesis_header.hash()];
-		let mut b = OpenBlock::new(engine.deref(), db, &genesis_header, last_hashes, Address::zero(), x!(3141562), vec![]);
+		let mut b = OpenBlock::new(engine.deref(), false, db, &genesis_header, last_hashes, Address::zero(), x!(3141562), vec![]);
 		let mut uncle = Header::new();
 		let uncle_author = address_from_hex("ef2d6d194084c2de36e0dabfce45d046b37d1106");
 		uncle.author = uncle_author.clone();
@@ -512,4 +507,3 @@ mod tests {
 
 	// TODO: difficulty test
 }
-
