@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-///
 /// BlockChain synchronization strategy.
 /// Syncs to peers and keeps up to date.
 /// This implementation uses ethereum protocol v63
@@ -22,11 +21,86 @@
 /// Syncing strategy.
 ///
 /// 1. A peer arrives with a total difficulty better than ours
-/// 2. Find a common best block between our an peer chain.
-/// Start with out best block and request headers from peer backwards until a common block is found
-/// 3. Download headers and block bodies from peers in parallel.
-/// As soon as a set of the blocks is fully downloaded at the head of the queue it is fed to the blockchain
-/// 4. Maintain sync by handling NewBlocks/NewHashes messages
+/// 2. Find a common best block between our an peer chain. Download a number of block headers N blocks apart,
+/// splitting the chain into ranges of N blocks
+/// 3. For each ranges download its blocks in parallel. Feed blocks to the block queue.
+/// Repeat 2 and 3 until there are blocks to download
+///
+/// Sync state consists of the following data:
+/// - state: State enum: ChainHead, Blocks, Idle, Waiting
+/// - blocks: A HashMap of the block hash to the block data. Block data includes optional block body
+/// and an optional pointer to the following block.
+/// - subchains: Presumably ordered vector of block subchain heads to download. We assume it is ordered in
+/// ascending block number order, but this is not guaranteed by the protocol.
+/// - last_imported_block_hash: Last imported / common block hash
+/// - last_imported_block_number: Last imported / common block number
+/// - header_ids: A mapping of block tx and uncle hashes to block hash for all blocks in `blocks` with
+/// bodies not downloaded yet
+/// - peers: A collection of connected peers. For each peer we maintain its last known total difficulty, which
+/// is uptated on Status and NewBlock messages, starting block hash being requested if any.
+///
+/// Algorithm:
+/// 	We start with all collections empty, last_imported_block and last_imported_hash set to best block in the
+/// 	blockchain, state set to ChainHead.
+///
+/// General behaviour (all states):
+/// 	When a new header is received with non-empty body an ID is added to `header_ids`
+/// 	When a peer finishes downloading header or bodies, or disconnects, downloading_headers and downloading_bodies
+/// 	are cleaned of the hashes requested from the peer.
+/// 	When a block body is downloaded, its ID is removed from `header_ids`
+/// 	When a block header is downloaded and inserted into `blocks` and it has no uncles nor transactions, an empty
+/// 	body is generated and inserted with the block.
+///
+///
+/// Workflow for ChainHead state.
+/// In this state we try to get subchain headers with a single GetBlockHeaders request.
+/// 	On NewPeer:
+/// 		1.1 If peer's total difficulty is higher, request N headers with interval M starting from `last_imported_hash`
+/// 	On BlockHeaders:
+/// 		if got 0 headers:
+/// 			decrease `last_imported_block_number`, get new `last_imported_hash` from the blockchain, go to 1.1
+/// 		if we already have all the headers in the block chain or block queue:
+/// 			set state to Idle,
+/// 		else
+/// 			set subchains to received header hashes, add all headers to `blocks`, set `state` to `Blocks`
+///
+/// 	All other messages are ignored.
+///
+/// Workflow for Blocks state.
+/// In this state we download block headers and bodies from multiple peers.
+/// 	On NewPeer:
+/// 		2.1 Find blocks or headers to download. Traverse `blocks` using `next` pointer starting from `last_imported_hash`,
+/// 		collect hashes for blocks with missing bodies which are not yet in `downloading_bodies`
+/// 		If there are some bodies to download:
+/// 			add them to `downloading_bodies`, issue a download request.
+/// 		Else find headers to download. Find first element in`subchains` which is not in `downloading_headers`, add it to
+/// 		`downloading_headers`, request X headers.
+/// 	On BlockHeaders:
+/// 		Validate received headers. For each header find a parent in `blocks` or packet data. Update `next` pointer for
+/// 		each parent block.
+/// 		2.2 Collect blocks. Traverse `blocks` starting from `last_imported_hash` until the first block with missing body.
+/// 		Add all blocks with bodies to the block queue, update `last_imported_hash` and `last_imported_block_number`.
+/// 		Update `subchains`. For each subchain head traverse `blocks` until either:
+/// 			The end. Add it as a new subchain
+/// 			Existing subchain head is found, in which case it is removed and two subchains are merged.
+/// 		If `blocks` is empty set state to ChainHead and go to 1.1
+/// 		Go to 2.1
+/// 	On BlockBodies:
+/// 		For each body find a matching header in header_ids. If there is a match found, update block body for corresponding
+/// 		block in `blocks`. Go to 2.2
+///
+/// 	All other messages are ignored.
+///
+/// Workflow for Idle state.
+/// 	On NewBlock:
+/// 		Import the block. If the block is unknown set the state to ChainHead, go to 1.1
+/// 	On NewHashes:
+/// 		Set the state to ChainHead, goto 1.1
+///
+/// 	All other messages are ignored.
+///
+///
+///
 ///
 
 use util::*;
@@ -34,7 +108,6 @@ use std::mem::{replace};
 use ethcore::views::{HeaderView};
 use ethcore::header::{BlockNumber, Header as BlockHeader};
 use ethcore::client::{BlockChainClient, BlockStatus, BlockId, BlockChainInfo};
-use range_collection::{RangeCollection, ToUsize, FromUsize};
 use ethcore::error::*;
 use ethcore::transaction::SignedTransaction;
 use ethcore::block::Block;
@@ -43,19 +116,7 @@ use io::SyncIo;
 use time;
 use super::SyncConfig;
 
-known_heap_size!(0, PeerInfo, Header, HeaderId);
-
-impl ToUsize for BlockNumber {
-	fn to_usize(&self) -> usize {
-		*self as usize
-	}
-}
-
-impl FromUsize for BlockNumber {
-	fn from_usize(s: usize) -> BlockNumber {
-		s as BlockNumber
-	}
-}
+known_heap_size!(0, PeerInfo, HeaderId, SyncBlock);
 
 type PacketDecodeError = DecoderError;
 
@@ -87,13 +148,11 @@ const RECEIPTS_PACKET: u8 = 0x10;
 
 const CONNECTION_TIMEOUT_SEC: f64 = 5f64;
 
-struct Header {
-	/// Header data
-	data: Bytes,
-	/// Block hash
-	hash: H256,
-	/// Parent hash
+struct SyncBlock {
+	header: Bytes,
+	body: Option<Bytes>,
 	parent: H256,
+	next: Option<H256>,
 }
 
 /// Used to identify header by transactions and uncles hashes
@@ -106,8 +165,8 @@ struct HeaderId {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 /// Sync state
 pub enum SyncState {
-	/// Initial chain sync has not started yet
-	NotSynced,
+	/// Downloading subchain heads
+	ChainHead,
 	/// Initial chain sync complete. Waiting for new packets
 	Idle,
 	/// Block downloading paused. Waiting for block queue to process blocks and free some space
@@ -171,7 +230,7 @@ struct PeerInfo {
 	/// Type of data currenty being requested from peer.
 	asking: PeerAsking,
 	/// A set of block numbers being requested
-	asking_blocks: Vec<BlockNumber>,
+	asking_blocks: Vec<H256>,
 	/// Holds requested header hash if currently requesting block header by hash
 	asking_hash: Option<H256>,
 	/// Request timestamp
@@ -187,32 +246,29 @@ pub struct ChainSync {
 	starting_block: BlockNumber,
 	/// Highest block number seen
 	highest_block: Option<BlockNumber>,
-	/// Set of block header numbers being downloaded
-	downloading_headers: HashSet<BlockNumber>,
-	/// Set of block body numbers being downloaded
-	downloading_bodies: HashSet<BlockNumber>,
-	/// Set of block headers being downloaded by hash
-	downloading_hashes: HashSet<H256>,
-	/// Downloaded headers.
-	headers: Vec<(BlockNumber, Vec<Header>)>, //TODO: use BTreeMap once range API is sable. For now it is a vector sorted in descending order
-	/// Downloaded bodies
-	bodies: Vec<(BlockNumber, Vec<Bytes>)>, //TODO: use BTreeMap once range API is sable. For now it is a vector sorted in descending order
+	/// Set of block header hashes being downloaded
+	downloading_headers: HashSet<H256>,
+	/// Set of block bodies being downloaded identified by block hash.
+	downloading_bodies: HashSet<H256>,
+	/// Heads of subchains to download
+	subchains: VecDeque<H256>,
+	/// Downloaded blocks.
+	blocks: HashMap<H256, SyncBlock>,
 	/// Peer info
 	peers: HashMap<PeerId, PeerInfo>,
 	/// Used to map body to header
-	header_ids: HashMap<HeaderId, BlockNumber>,
+	header_ids: HashMap<HeaderId, H256>,
 	/// Last impoted block number
-	last_imported_block: Option<BlockNumber>,
+	last_imported_block: BlockNumber,
 	/// Last impoted block hash
-	last_imported_hash: Option<H256>,
+	last_imported_hash: H256,
+	subchain_head: Option<H256>,
 	/// Syncing total  difficulty
 	syncing_difficulty: U256,
-	/// True if common block for our and remote chain has been found
-	have_common_block: bool,
 	/// Last propagated block number
 	last_sent_block_number: BlockNumber,
 	/// Max blocks to download ahead
-	max_download_ahead_blocks: usize,
+	//max_download_ahead_blocks: usize,
 	/// Network ID
 	network_id: U256,
 	/// Miner
@@ -223,24 +279,24 @@ type RlpResponseResult = Result<Option<(PacketId, RlpStream)>, PacketDecodeError
 
 impl ChainSync {
 	/// Create a new instance of syncing strategy.
-	pub fn new(config: SyncConfig, miner: Arc<Miner>) -> ChainSync {
+	pub fn new(config: SyncConfig, miner: Arc<Miner>, chain: &BlockChainClient) -> ChainSync {
+		let chain = chain.chain_info();
 		ChainSync {
-			state: SyncState::NotSynced,
+			state: SyncState::ChainHead,
 			starting_block: 0,
 			highest_block: None,
 			downloading_headers: HashSet::new(),
 			downloading_bodies: HashSet::new(),
-			downloading_hashes: HashSet::new(),
-			headers: Vec::new(),
-			bodies: Vec::new(),
+			subchains: VecDeque::new(),
+			blocks: HashMap::new(),
 			peers: HashMap::new(),
 			header_ids: HashMap::new(),
-			last_imported_block: None,
-			last_imported_hash: None,
+			last_imported_block: chain.best_block_number,
+			last_imported_hash: chain.best_block_hash,
+			subchain_head: None,
 			syncing_difficulty: U256::from(0u64),
-			have_common_block: false,
 			last_sent_block_number: 0,
-			max_download_ahead_blocks: max(MAX_HEADERS_TO_REQUEST, config.max_download_ahead_blocks),
+			//max_download_ahead_blocks: max(MAX_HEADERS_TO_REQUEST, config.max_download_ahead_blocks),
 			network_id: config.network_id,
 			miner: miner,
 		}
@@ -253,19 +309,18 @@ impl ChainSync {
 			protocol_version: 63,
 			network_id: self.network_id,
 			start_block_number: self.starting_block,
-			last_imported_block_number: self.last_imported_block,
+			last_imported_block_number: Some(self.last_imported_block),
 			highest_block_number: self.highest_block,
-			blocks_received: match self.last_imported_block { Some(x) if x > self.starting_block => x - self.starting_block, _ => 0 },
+			blocks_received: if self.last_imported_block > self.starting_block { self.last_imported_block - self.starting_block } else { 0 },
 			blocks_total: match self.highest_block { Some(x) if x > self.starting_block => x - self.starting_block, _ => 0 },
 			num_peers: self.peers.len(),
 			num_active_peers: self.peers.values().filter(|p| p.asking != PeerAsking::Nothing).count(),
 			mem_used:
 				//  TODO: https://github.com/servo/heapsize/pull/50
-				//  self.downloading_hashes.heap_size_of_children()
 				//+ self.downloading_bodies.heap_size_of_children()
-				//+ self.downloading_hashes.heap_size_of_children()
-				self.headers.heap_size_of_children()
-				+ self.bodies.heap_size_of_children()
+				//+ self.downloading_headers.heap_size_of_children()
+				self.subchains.heap_size_of_children()
+				+ self.blocks.heap_size_of_children()
 				+ self.peers.heap_size_of_children()
 				+ self.header_ids.heap_size_of_children(),
 		}
@@ -277,14 +332,13 @@ impl ChainSync {
 		self.peers.clear();
 	}
 
-
 	#[cfg_attr(feature="dev", allow(for_kv_map))] // Because it's not possible to get `values_mut()`
 	/// Rest sync. Clear all downloaded data but keep the queue
 	fn reset(&mut self) {
 		self.downloading_headers.clear();
 		self.downloading_bodies.clear();
-		self.headers.clear();
-		self.bodies.clear();
+		self.blocks.clear();
+		self.subchains.clear();
 		for (_, ref mut p) in &mut self.peers {
 			p.asking_blocks.clear();
 			p.asking_hash = None;
@@ -299,9 +353,8 @@ impl ChainSync {
 		self.reset();
 		self.starting_block = 0;
 		self.highest_block = None;
-		self.have_common_block = false;
 		self.starting_block = io.chain().chain_info().best_block_number;
-		self.state = SyncState::NotSynced;
+		self.state = SyncState::ChainHead;
 	}
 
 	/// Called by peer to report status
@@ -339,7 +392,7 @@ impl ChainSync {
 
 		self.peers.insert(peer_id.clone(), peer);
 		debug!(target: "sync", "Connected {}:{}", peer_id, io.peer_info(peer_id));
-		self.sync_peer(io, peer_id, false);
+		self.sync_peer(io, peer_id);
 		Ok(())
 	}
 
@@ -350,7 +403,7 @@ impl ChainSync {
 		let item_count = r.item_count();
 		trace!(target: "sync", "{} -> BlockHeaders ({} entries)", peer_id, item_count);
 		self.clear_peer_download(peer_id);
-		if self.state != SyncState::Blocks && self.state != SyncState::NewBlocks && self.state != SyncState::Waiting {
+		if self.state == SyncState::Idle {
 			trace!(target: "sync", "Ignored unexpected block headers");
 			return Ok(());
 		}
@@ -359,11 +412,12 @@ impl ChainSync {
 			return Ok(());
 		}
 
+		let mut blocks = HashMap::new();
 		for i in 0..item_count {
 			let info: BlockHeader = try!(r.val_at(i));
 			let number = BlockNumber::from(info.number);
-			if (number <= self.current_base_block() && self.have_common_block) || self.headers.have_item(&number) {
-				trace!(target: "sync", "Skipping existing block header");
+			if self.blocks.contains_key(&info.hash()) {
+				trace!(target: "sync", "Skipping existing block header {} ({:?})", number, info.hash());
 				continue;
 			}
 
@@ -373,74 +427,129 @@ impl ChainSync {
 			let hash = info.hash();
 			match io.chain().block_status(BlockId::Hash(hash.clone())) {
 				BlockStatus::InChain | BlockStatus::Queued => {
-					if !self.have_common_block || self.current_base_block() < number {
-						self.last_imported_block = Some(number);
-						self.last_imported_hash = Some(hash.clone());
-					}
-					if !self.have_common_block {
-						self.have_common_block = true;
-						trace!(target: "sync", "Found common header {} ({})", number, hash);
-					} else {
-						trace!(target: "sync", "Header already in chain {} ({})", number, hash);
+					match self.state {
+						SyncState::Blocks | SyncState::NewBlocks => warn!(target: "sync", "Header already in chain {} ({})", number, hash),
+						_ => warn!(target: "sync", "Unexpected header already in chain {} ({}), state = {:?}", number, hash, self.state),
 					}
 				},
-				_ => {
-					if self.have_common_block {
-						//validate chain
-						let base_hash = self.last_imported_hash.clone().unwrap();
-						if self.have_common_block && number == self.current_base_block() + 1 && info.parent_hash != base_hash {
-							// Part of the forked chain. Restart to find common block again
-							debug!(target: "sync", "Mismatched block header {} {}, restarting sync", number, hash);
-							self.restart(io);
-							self.continue_sync(io);
-							return Ok(());
-						}
-						if self.headers.find_item(&(number - 1)).map_or(false, |p| p.hash != info.parent_hash) {
-							// mismatching parent id, delete the previous block and don't add this one
-							debug!(target: "sync", "Mismatched block header {} {}", number, hash);
-							self.remove_downloaded_blocks(number - 1);
-							continue;
-						}
-						if self.headers.find_item(&(number + 1)).map_or(false, |p| p.parent != hash) {
-							// mismatching parent id for the next block, clear following headers
-							debug!(target: "sync", "Mismatched block header {}", number + 1);
-							self.remove_downloaded_blocks(number + 1);
-						}
-						if self.have_common_block && number < self.current_base_block() + 1 {
-							// unkown header
-							debug!(target: "sync", "Old block header {:?} ({}) is unknown, restarting sync", hash, number);
-							self.restart(io);
-							self.continue_sync(io);
-							return Ok(());
-						}
-					}
-					let hdr = Header {
-						data: try!(r.at(i)).as_raw().to_vec(),
-						hash: hash.clone(),
+				BlockStatus::Bad => {
+					warn!(target: "sync", "Bad header {} ({}) from {}: {}, state = {:?}", number, hash, peer_id, io.peer_info(peer_id), self.state);
+					io.disable_peer(peer_id);
+					return Ok(());
+				},
+				BlockStatus::Unknown => {
+					let mut block = SyncBlock {
+						header: try!(r.at(i)).as_raw().to_vec(),
 						parent: info.parent_hash,
+						next: None,
+						body: None,
 					};
-					self.headers.insert_item(number, hdr);
 					let header_id = HeaderId {
 						transactions_root: info.transactions_root,
 						uncles: info.uncles_hash
 					};
 					trace!(target: "sync", "Got header {} ({})", number, hash);
 					if header_id.transactions_root == rlp::SHA3_NULL_RLP && header_id.uncles == rlp::SHA3_EMPTY_LIST_RLP {
-						//empty body, just mark as downloaded
+						// empty body, just mark as downloaded
 						let mut body_stream = RlpStream::new_list(2);
 						body_stream.append_raw(&rlp::NULL_RLP, 1);
 						body_stream.append_raw(&rlp::EMPTY_LIST_RLP, 1);
-						self.bodies.insert_item(number, body_stream.out());
+						block.body = Some(body_stream.out());
 					}
 					else {
-						self.header_ids.insert(header_id, number);
+						self.header_ids.insert(header_id, hash.clone());
+					}
+					blocks.insert(hash.clone(), block);
+				}
+			}
+		}
+
+		match self.state {
+			SyncState::ChainHead => {
+				if blocks.is_empty() {
+					// peer is not on our chain
+					// track back and try again
+					if self.last_imported_block > 0 {
+						match io.chain().block_hash(BlockId::Number(self.last_imported_block - 1)) {
+							Some(h) => {
+								self.last_imported_block -= 1;
+								self.last_imported_hash = h;
+								trace!(target: "sync", "Searching common header {} ({})", self.last_imported_block, self.last_imported_hash);
+							}
+							None => {
+								// TODO: get hash by number from the block queue
+								trace!(target: "sync", "Could not revert to previous block, last: {} ({})", self.last_imported_block, self.last_imported_hash);
+							}
+						}
+					} else {
+						trace!(target: "sync", "Received {} subchain heads, proceeding to download", blocks.len());
+						self.subchains.clear();
+						self.subchains.push_back(self.last_imported_hash);
+						self.subchains.extend(blocks.keys());
+						self.blocks = blocks;
+						self.state = SyncState::Blocks;
+					}
+				}
+			},
+			SyncState::Blocks | SyncState::NewBlocks | SyncState::Waiting => {
+
+				// validate received subchain
+				let mut parents: Vec<_> = blocks.values().map(|v| v.parent).collect();
+				for p in parents.drain(..) {
+					if let Some(ref mut block) = blocks.get_mut(&p) {
+						block.next = Some(p);
+					}
+					else if let Some(ref mut block) = self.blocks.get_mut(&p) {
+						block.next = Some(p);
+					}
+					else if p == self.last_imported_hash {
+						self.subchain_head = Some(p)
+					}
+					else {
+						warn!("Invalid headers from {}:{}, unknown parent {:?}", peer_id, io.peer_info(peer_id), p);
+						io.disable_peer(peer_id);
+						break;
+					}
+				}
+				for (h, b) in blocks.drain() {
+					if self.blocks.get(&h).is_some() {
+						trace!(target: "sync", "Ignoring header we already have {}", h);
+						continue;
+					}
+					self.blocks.insert(h, b);
+				}
+			},
+			_ => warn!(target: "sync", "Unexpected headers({}) from  {} ({}), state = {:?}", blocks.len(), peer_id, io.peer_info(peer_id), self.state)
+		}
+
+		self.advance_subchains();
+		self.collect_blocks(io);
+		self.continue_sync(io);
+		Ok(())
+	}
+
+	// update subchain headers
+	fn advance_subchains(&mut self) {
+		let mut new_subchains = VecDeque::new();
+		let old_subchains: HashSet<_> = { self.subchains.iter().map(Clone::clone).collect() };
+		for s in self.subchains.drain(..) {
+			let mut h = s.clone();
+			loop {
+				match self.blocks.get(&h) {
+					Some(block) if block.next.is_some() => {
+						h = block.next.unwrap();
+						if old_subchains.contains(&h) {
+							break; // reached head of the other subchain, merge by not adding
+						}
+					},
+					_ => {
+						new_subchains.push_back(h);
+						break;
 					}
 				}
 			}
 		}
-		self.collect_blocks(io);
-		self.continue_sync(io);
-		Ok(())
+		self.subchains = new_subchains;
 	}
 
 	/// Called by peer once it has new block bodies
@@ -468,14 +577,17 @@ impl ChainSync {
 				uncles: uncles
 			};
 			match self.header_ids.get(&header_id).cloned() {
-				Some(n) => {
+				Some(h) => {
 					self.header_ids.remove(&header_id);
-					self.bodies.insert_item(n, body.as_raw().to_vec());
-					trace!(target: "sync", "Got body {}", n);
+					match self.blocks.get_mut(&h) {
+						Some(ref mut block) => {
+							trace!(target: "sync", "Got body {}", h);
+							block.body = Some(body.as_raw().to_vec());
+						},
+						None => warn!("Got body with no header {}", h)
+					}
 				}
-				None =>  {
-					trace!(target: "sync", "Ignored unknown/stale block body");
-				}
+				None => trace!(target: "sync", "Ignored unknown/stale block body")
 			}
 		}
 		self.collect_blocks(io);
@@ -490,7 +602,7 @@ impl ChainSync {
 		let header_rlp = try!(block_rlp.at(0));
 		let h = header_rlp.as_raw().sha3();
 		trace!(target: "sync", "{} -> NewBlock ({})", peer_id, h);
-		if !self.have_common_block {
+		if self.state != SyncState::Idle {
 			trace!(target: "sync", "NewBlock ignored while seeking");
 			return Ok(());
 		}
@@ -501,8 +613,7 @@ impl ChainSync {
 			peer.latest_hash = header.hash();
 			peer.latest_number = Some(header.number());
 		}
-		// TODO: Decompose block and add to self.headers and self.bodies instead
-		if header.number <= From::from(self.current_base_block() + 1) {
+		if header.number <= self.last_imported_block + 1 {
 			match io.chain().import_block(block_rlp.as_raw().to_vec()) {
 				Err(Error::Import(ImportError::AlreadyInChain)) => {
 					trace!(target: "sync", "New block already in chain {:?}", h);
@@ -511,10 +622,9 @@ impl ChainSync {
 					trace!(target: "sync", "New block already queued {:?}", h);
 				},
 				Ok(_) => {
-					if self.current_base_block() < header.number {
-						self.last_imported_block = Some(header.number);
-						self.last_imported_hash = Some(header.hash());
-						self.remove_downloaded_blocks(header.number);
+					if header.number == self.last_imported_block + 1 {
+						self.last_imported_block = header.number;
+						self.last_imported_hash = header.hash();
 					}
 					trace!(target: "sync", "New block queued {:?} ({})", h, header.number);
 				},
@@ -532,13 +642,14 @@ impl ChainSync {
 			unknown = true;
 		}
 		if unknown {
-			trace!(target: "sync", "New block unknown {:?}", h);
+			trace!(target: "sync", "New unknown block {:?}", h);
 			//TODO: handle too many unknown blocks
 			let difficulty: U256 = try!(r.val_at(1));
 			let peer_difficulty = self.peers.get_mut(&peer_id).unwrap().difficulty;
 			if difficulty > peer_difficulty {
+				self.state = SyncState::ChainHead;
 				trace!(target: "sync", "Received block {:?}  with no known parent. Peer needs syncing...", h);
-				self.sync_peer(io, peer_id, true);
+				self.sync_peer(io, peer_id);
 			}
 		}
 		Ok(())
@@ -546,7 +657,7 @@ impl ChainSync {
 
 	/// Handles NewHashes packet. Initiates headers download for any unknown hashes.
 	fn on_peer_new_hashes(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
-		if self.peers.get_mut(&peer_id).unwrap().asking != PeerAsking::Nothing {
+		if self.state != SyncState::Idle {
 			trace!(target: "sync", "Ignoring new hashes since we're already downloading.");
 			return Ok(());
 		}
@@ -556,7 +667,7 @@ impl ChainSync {
 		for (rh, rd) in hashes {
 			let h = try!(rh);
 			let d = try!(rd);
-			if self.downloading_hashes.contains(&h) {
+			if self.downloading_headers.contains(&h) || self.downloading_bodies.contains(&h) {
 				continue;
 			}
 			match io.chain().block_status(BlockId::Hash(h.clone())) {
@@ -583,7 +694,8 @@ impl ChainSync {
 			}
 		};
 		if max_height != 0 {
-			self.sync_peer(io, peer_id, true);
+			self.state = SyncState::ChainHead;
+			self.sync_peer(io, peer_id);
 		}
 		Ok(())
 	}
@@ -613,7 +725,7 @@ impl ChainSync {
 		let mut peers: Vec<(PeerId, U256)> = self.peers.iter().map(|(k, p)| (*k, p.difficulty)).collect();
 		peers.sort_by(|&(_, d1), &(_, d2)| d1.cmp(&d2).reverse()); //TODO: sort by rating
 		for (p, _) in peers {
-			self.sync_peer(io, p, false);
+			self.sync_peer(io, p);
 		}
 	}
 
@@ -631,7 +743,7 @@ impl ChainSync {
 	}
 
 	/// Find something to do for a peer. Called for a new peer or when a peer is done with it's task.
-	fn sync_peer(&mut self, io: &mut SyncIo,  peer_id: PeerId, force: bool) {
+	fn sync_peer(&mut self, io: &mut SyncIo,  peer_id: PeerId) {
 		let (peer_latest, peer_difficulty) = {
 			let peer = self.peers.get_mut(&peer_id).unwrap();
 			if peer.asking != PeerAsking::Nothing {
@@ -643,140 +755,88 @@ impl ChainSync {
 			}
 			(peer.latest_hash.clone(), peer.difficulty.clone())
 		};
-
 		let td = io.chain().chain_info().pending_total_difficulty;
 		let syncing_difficulty = max(self.syncing_difficulty, td);
-		if force || peer_difficulty > syncing_difficulty {
-			// start sync
-			self.syncing_difficulty = peer_difficulty;
-			if self.state == SyncState::Idle || self.state == SyncState::NotSynced {
-				self.state = SyncState::Blocks;
-			}
-			trace!(target: "sync", "Starting sync with better chain");
-			self.peers.get_mut(&peer_id).unwrap().asking_hash = Some(peer_latest.clone());
-			self.downloading_hashes.insert(peer_latest.clone());
-			self.request_headers_by_hash(io, peer_id, &peer_latest, 1, 0, false);
-		}
-		else if self.state == SyncState::Blocks && io.chain().block_status(BlockId::Hash(peer_latest)) == BlockStatus::Unknown {
-			self.request_blocks(io, peer_id, false);
-		}
-	}
 
-	fn current_base_block(&self) -> BlockNumber {
-		match self.last_imported_block { None => 0, Some(x) => x }
-	}
-
-	fn find_block_bodies_hashes_to_request(&self, ignore_others: bool) -> (Vec<H256>, Vec<BlockNumber>) {
-		let mut needed_bodies: Vec<H256> = Vec::new();
-		let mut needed_numbers: Vec<BlockNumber> = Vec::new();
-
-		if self.have_common_block && !self.headers.is_empty() && self.headers.range_iter().next().unwrap().0 == self.current_base_block() + 1 {
-			if let Some((start, ref items)) = self.headers.range_iter().next() {
-				let mut index: BlockNumber = 0;
-				while index != items.len() as BlockNumber && needed_bodies.len() < MAX_BODIES_TO_REQUEST {
-					let block = start + index;
-					if  ignore_others || (!self.downloading_bodies.contains(&block) && !self.bodies.have_item(&block)) {
-						needed_bodies.push(items[index as usize].hash.clone());
-						needed_numbers.push(block);
-					}
-					index += 1;
+		match self.state {
+			SyncState::Idle => {
+				self.state = SyncState::ChainHead;
+				self.sync_peer(io, peer_id);
+			},
+			SyncState::ChainHead => {
+				// Request subchain headers
+				if peer_difficulty > syncing_difficulty {
+					trace!(target: "sync", "Starting sync with better chain");
+					let last = self.last_imported_hash.clone();
+					self.request_headers_by_hash(io, peer_id, &last, 128, 256, false);
+				}
+			},
+			SyncState::Blocks | SyncState::NewBlocks => {
+				if io.chain().block_status(BlockId::Hash(peer_latest)) == BlockStatus::Unknown {
+					self.request_blocks(io, peer_id, false);
 				}
 			}
+			SyncState::Waiting => ()
 		}
-		(needed_bodies, needed_numbers)
+	}
+
+	fn find_block_bodies_to_request(&self, _ignore_others: bool) -> Vec<H256> {
+		if self.subchain_head.is_none() {
+			return Vec::new();
+		}
+		let mut needed_bodies: Vec<H256> = Vec::new();
+		let head = self.subchain_head;
+		while head.is_some() && needed_bodies.len() < MAX_BODIES_TO_REQUEST {
+			match self.blocks.get(&head.unwrap()) {
+				Some(block) if block.body.is_none() && block.next.is_some() => {
+					needed_bodies.push(head.unwrap().clone());
+				}
+				_ => break,
+			}
+		}
+		needed_bodies
 	}
 
 	/// Find some headers or blocks to download for a peer.
 	fn request_blocks(&mut self, io: &mut SyncIo, peer_id: PeerId, ignore_others: bool) {
 		self.clear_peer_download(peer_id);
-
 		if io.chain().queue_info().is_full() {
 			self.pause_sync();
 			return;
 		}
 
 		// check to see if we need to download any block bodies first
-		let (needed_bodies, needed_numbers) = self.find_block_bodies_hashes_to_request(ignore_others);
+		let needed_bodies = self.find_block_bodies_to_request(ignore_others);
 		if !needed_bodies.is_empty() {
-			let (head, _) = self.headers.range_iter().next().unwrap();
-			if needed_numbers.first().unwrap() - head > self.max_download_ahead_blocks as BlockNumber {
-				trace!(target: "sync", "{}: Stalled download ({} vs {}), helping with downloading block bodies", peer_id, needed_numbers.first().unwrap(), head);
-				self.request_blocks(io, peer_id, true);
-			} else {
-				self.downloading_bodies.extend(needed_numbers.iter());
-				replace(&mut self.peers.get_mut(&peer_id).unwrap().asking_blocks, needed_numbers);
-				self.request_bodies(io, peer_id, needed_bodies);
-			}
+			//if needed_numbers.first().unwrap() - head > self.max_download_ahead_blocks as BlockNumber {
+			//	trace!(target: "sync", "{}: Stalled download ({} vs {}), helping with downloading block bodies", peer_id, needed_numbers.first().unwrap(), head);
+			//	self.request_blocks(io, peer_id, true);
+			//} else {
+			self.downloading_bodies.extend(needed_bodies.iter());
+			replace(&mut self.peers.get_mut(&peer_id).unwrap().asking_blocks, needed_bodies.clone());
+			self.request_bodies(io, peer_id, needed_bodies);
+			//}
 			return;
 		}
 
-		// check if need to download headers
-		let mut start = 0;
-		if !self.have_common_block {
-			// download backwards until common block is found 1 header at a time
-			let chain_info = io.chain().chain_info();
-			start = match self.last_imported_block {
-				Some(n) => n,
-				None => chain_info.best_block_number,
-			};
-			if !self.headers.is_empty() {
-				start = min(start, self.headers.range_iter().next().unwrap().0 - 1);
-			}
-			if start == 0 {
-				self.have_common_block = true; //reached genesis
-				self.last_imported_hash = Some(chain_info.genesis_hash);
-				self.last_imported_block = Some(0);
-			}
-		}
-		if self.have_common_block {
-			let mut headers: Vec<BlockNumber> = Vec::new();
-			let mut prev = self.current_base_block() + 1;
-			let head = self.headers.range_iter().next().map(|(h, _)| h);
-			for (next, ref items) in self.headers.range_iter() {
-				if !headers.is_empty() {
+		// find subchain to download
+		let mut download = None;
+		{
+			for h in &self.subchains {
+				if ignore_others || !self.downloading_headers.contains(&h) {
+					self.downloading_headers.insert(h.clone());
+					replace(&mut self.peers.get_mut(&peer_id).unwrap().asking_blocks, vec![h.clone()]);
+					download = Some(h.clone());
 					break;
 				}
-				if next <= prev {
-					prev = next + items.len() as BlockNumber;
-					continue;
-				}
-				let mut block = prev;
-				while block < next && headers.len() < MAX_HEADERS_TO_REQUEST {
-					if ignore_others || !self.downloading_headers.contains(&(block as BlockNumber)) {
-						headers.push(block as BlockNumber);
-					}
-					block += 1;
-				}
-				prev = next + items.len() as BlockNumber;
-			}
-
-			if !headers.is_empty() {
-				start = headers[0];
-				if head.is_some() && start > head.unwrap() && start - head.unwrap() > self.max_download_ahead_blocks as BlockNumber {
-					trace!(target: "sync", "{}: Stalled download ({} vs {}), helping with downloading headers", peer_id, start, head.unwrap());
-					self.request_blocks(io, peer_id, true);
-					return;
-				}
-				let count = headers.len();
-				self.downloading_headers.extend(headers.iter());
-				replace(&mut self.peers.get_mut(&peer_id).unwrap().asking_blocks, headers);
-				assert!(!self.headers.have_item(&start));
-				self.request_headers_by_number(io, peer_id, start, count, 0, false);
 			}
 		}
-		else {
-			// continue search for common block
-			self.downloading_headers.insert(start);
-			self.request_headers_by_number(io, peer_id, start, 1, 0, false);
-		}
+		download.map(|h| self.request_headers_by_hash(io, peer_id, &h, MAX_HEADERS_TO_REQUEST, 0, false));
 	}
 
 	/// Clear all blocks/headers marked as being downloaded by a peer.
 	fn clear_peer_download(&mut self, peer_id: PeerId) {
 		let peer = self.peers.get_mut(&peer_id).unwrap();
-		if let Some(hash) = peer.asking_hash.take() {
-			self.downloading_hashes.remove(&hash);
-		}
 		for b in &peer.asking_blocks {
 			self.downloading_headers.remove(&b);
 			self.downloading_bodies.remove(&b);
@@ -786,28 +846,33 @@ impl ChainSync {
 
 	/// Checks if there are blocks fully downloaded that can be imported into the blockchain and does the import.
 	fn collect_blocks(&mut self, io: &mut SyncIo) {
-		if !self.have_common_block || self.headers.is_empty() || self.bodies.is_empty() {
+		if self.blocks.is_empty() || self.subchain_head.is_none() {
 			return;
 		}
 
 		let mut restart = false;
-		// merge headers and bodies
+		let mut imported = HashSet::new();
 		{
-			let headers = self.headers.range_iter().next().unwrap();
-			let bodies = self.bodies.range_iter().next().unwrap();
-			if headers.0 != bodies.0 || headers.0 > self.current_base_block() + 1 {
-				return;
+			let head = self.subchain_head.unwrap();
+			let mut blocks = Vec::new();
+			loop {
+				match self.blocks.get(&head) {
+					Some(block) if block.body.is_some() && block.next.is_some() => {
+						self.subchain_head = block.next.clone();
+						blocks.push((head, block));
+					}
+					_ => break,
+				}
 			}
 
-			let count = min(headers.1.len(), bodies.1.len());
-			let mut imported = 0;
-			for i in 0..count {
+			let count = blocks.len();
+			for (h, block) in blocks.drain(..) {
 				let mut block_rlp = RlpStream::new_list(3);
-				block_rlp.append_raw(&headers.1[i].data, 1);
-				let body = Rlp::new(&bodies.1[i]);
+				block_rlp.append_raw(&block.header, 1);
+				let body = Rlp::new(&block.body.as_ref().unwrap()); // incomplete blocks are filtered out in the loop above
 				block_rlp.append_raw(body.at(0).as_raw(), 1);
 				block_rlp.append_raw(body.at(1).as_raw(), 1);
-				let h = &headers.1[i].hash;
+				let number = HeaderView::new(&block.header).number();
 
 				// Perform basic block verification
 				if !Block::is_good(block_rlp.as_raw()) {
@@ -819,27 +884,31 @@ impl ChainSync {
 				match io.chain().import_block(block_rlp.out()) {
 					Err(Error::Import(ImportError::AlreadyInChain)) => {
 						trace!(target: "sync", "Block already in chain {:?}", h);
-						self.last_imported_block = Some(headers.0 + i as BlockNumber);
-						self.last_imported_hash = Some(h.clone());
+						self.last_imported_block = number;
+						self.last_imported_hash = h.clone();
 					},
 					Err(Error::Import(ImportError::AlreadyQueued)) => {
 						trace!(target: "sync", "Block already queued {:?}", h);
-						self.last_imported_block = Some(headers.0 + i as BlockNumber);
-						self.last_imported_hash = Some(h.clone());
+						self.last_imported_block = number;
+						self.last_imported_hash = h.clone();
 					},
 					Ok(_) => {
 						trace!(target: "sync", "Block queued {:?}", h);
-						self.last_imported_block = Some(headers.0 + i as BlockNumber);
-						self.last_imported_hash = Some(h.clone());
-						imported += 1;
+						self.last_imported_block = number;
+						self.last_imported_hash = h.clone();
 					},
 					Err(e) => {
 						debug!(target: "sync", "Bad block {:?} : {:?}", h, e);
 						restart = true;
+						break;
 					}
 				}
+				imported.insert(h.clone());
 			}
-			trace!(target: "sync", "Imported {} of {}", imported, count);
+			trace!(target: "sync", "Imported {} of {}", imported.len(), count);
+		}
+		for h in imported.drain() {
+			self.blocks.remove(&h);
 		}
 
 		if restart {
@@ -848,26 +917,9 @@ impl ChainSync {
 			return;
 		}
 
-		self.headers.remove_head(&(self.last_imported_block.unwrap() + 1));
-		self.bodies.remove_head(&(self.last_imported_block.unwrap() + 1));
-
-		if self.headers.is_empty() {
-			assert!(self.bodies.is_empty());
+		if self.blocks.is_empty() {
 			self.complete_sync();
 		}
-	}
-
-	/// Remove downloaded bocks/headers starting from specified number.
-	/// Used to recover from an error and re-download parts of the chain detected as bad.
-	fn remove_downloaded_blocks(&mut self, start: BlockNumber) {
-		let ids = self.header_ids.drain().filter(|&(_, v)| v < start).collect();
-		self.header_ids = ids;
-		let hdrs = self.downloading_headers.drain().filter(|v| *v < start).collect();
-		self.downloading_headers = hdrs;
-		let bodies = self.downloading_bodies.drain().filter(|v| *v < start).collect();
-		self.downloading_bodies = bodies;
-		self.headers.remove_from(&start);
-		self.bodies.remove_from(&start);
 	}
 
 	/// Request headers from a peer by block hash
@@ -875,17 +927,6 @@ impl ChainSync {
 		trace!(target: "sync", "{} <- GetBlockHeaders: {} entries starting from {}", peer_id, count, h);
 		let mut rlp = RlpStream::new_list(4);
 		rlp.append(h);
-		rlp.append(&count);
-		rlp.append(&skip);
-		rlp.append(&if reverse {1u32} else {0u32});
-		self.send_request(sync, peer_id, PeerAsking::BlockHeaders, GET_BLOCK_HEADERS_PACKET, rlp.out());
-	}
-
-	/// Request headers from a peer by block number
-	fn request_headers_by_number(&mut self, sync: &mut SyncIo, peer_id: PeerId, n: BlockNumber, count: usize, skip: usize, reverse: bool) {
-		let mut rlp = RlpStream::new_list(4);
-		trace!(target: "sync", "{} <- GetBlockHeaders: {} entries starting from {}", peer_id, count, n);
-		rlp.append(&n);
 		rlp.append(&count);
 		rlp.append(&skip);
 		rlp.append(&if reverse {1u32} else {0u32});
@@ -993,8 +1034,7 @@ impl ChainSync {
 				Some(hdr) => From::from(HeaderView::new(&hdr).number()),
 				None => last
 			}
-		}
-		else {
+		} else {
 			trace!(target: "sync", "-> GetBlockHeaders (number: {}, max: {}, skip: {}, reverse:{})", try!(r.val_at::<BlockNumber>(0)), max_headers, skip, reverse);
 			try!(r.val_at(0))
 		};
