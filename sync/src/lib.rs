@@ -74,6 +74,7 @@ use io::NetSyncIo;
 use chain::ChainSync;
 
 mod chain;
+mod blocks;
 mod io;
 
 #[cfg(test)]

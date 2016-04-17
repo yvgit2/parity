@@ -98,13 +98,13 @@ fn restart() {
 	net.restart_peer(0);
 
 	let status = net.peer(0).sync.status();
-	assert_eq!(status.state, SyncState::NotSynced);
+	assert_eq!(status.state, SyncState::Idle);
 }
 
 #[test]
 fn status_empty() {
 	let net = TestNet::new(2);
-	assert_eq!(net.peer(0).sync.status().state, SyncState::NotSynced);
+	assert_eq!(net.peer(0).sync.status().state, SyncState::ChainHead);
 }
 
 #[test]

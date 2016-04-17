@@ -933,7 +933,7 @@ impl<Message> IoHandler<NetworkIoMessage<Message>> for Host<Message> where Messa
 				if let Some(session) = session {
 					session.lock().unwrap().disconnect(DisconnectReason::DisconnectRequested);
 				}
-				self.kill_connection(*peer, io, false);
+				self.kill_connection(*peer, io, true);
 			},
 			NetworkIoMessage::User(ref message) => {
 				for (p, h) in self.handlers.read().unwrap().iter() {
