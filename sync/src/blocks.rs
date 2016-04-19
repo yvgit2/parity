@@ -76,7 +76,10 @@ impl BlockCollection {
 	fn insert_header(&mut self, header: Bytes) -> Result<H256, UtilError> {
 		let info: BlockHeader = try!(UntrustedRlp::new(&header).as_val());
 		let hash = info.hash();
-		debug_assert!(!self.blocks.contains_key(&hash));
+		if self.blocks.contains_key(&hash) {
+			return Ok(hash);
+		}
+		self.downloading_headers.remove(&hash);
 
 		let mut block = SyncBlock {
 			header: header,
@@ -111,6 +114,7 @@ impl BlockCollection {
 
 	pub fn reset_to(&mut self, hashes: Vec<H256>) {
 		self.clear();
+		self.head = hashes.first().cloned();
 		self.heads = hashes;
 	}
 
@@ -135,6 +139,7 @@ impl BlockCollection {
 		match self.header_ids.get(&header_id).cloned() {
 			Some(h) => {
 				self.header_ids.remove(&header_id);
+				self.downloading_bodies.remove(&h);
 				match self.blocks.get_mut(&h) {
 					Some(ref mut block) => {
 						trace!(target: "sync", "Got body {}", h);
@@ -234,12 +239,20 @@ impl BlockCollection {
 			let mut head = self.head.unwrap().clone();
 			let mut blocks = Vec::new();
 			loop {
+				if &head == self.heads.first().unwrap() {
+					break;
+				}
 				match self.blocks.get(&head) {
-					Some(block) if block.body.is_some() && block.next.is_some() => {
-						self.head = block.next.clone();
+					Some(block) if block.body.is_some() => {
 						blocks.push(block);
 						hashes.push(head);
-						head = block.next.unwrap().clone();
+						match block.next {
+							Some(h) => {
+								self.head = Some(h.clone());
+								head = h.clone();
+							},
+							None => break,
+						}
 					}
 					_ => break,
 				}
@@ -261,7 +274,7 @@ impl BlockCollection {
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.blocks.is_empty()
+		self.blocks.len() <= 1 && self.heads.len() <= 1
 	}
 
 	pub fn contains(&self, hash: &H256) -> bool {
@@ -284,6 +297,9 @@ mod test {
 
 	use super::BlockCollection;
 	use ethcore::client::{TestBlockChainClient, EachBlockWith, BlockId, BlockChainClient};
+	use ethcore::views::HeaderView;
+	use ethcore::header::BlockNumber;
+	use util::*;
 
 	fn is_empty(bc: &BlockCollection) -> bool {
 		bc.heads.is_empty() &&
@@ -306,6 +322,57 @@ mod test {
 		assert!(!is_empty(&bc));
 		bc.clear();
 		assert!(is_empty(&bc));
+	}
+
+	#[test]
+	fn insert_headers() {
+		let mut bc = BlockCollection::new();
+		assert!(is_empty(&bc));
+		let client = TestBlockChainClient::new();
+		let nblocks = 200;
+		client.add_blocks(nblocks, EachBlockWith::Nothing);
+		let blocks: Vec<_> = (0 .. nblocks).map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap()).collect();
+		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let heads: Vec<_> = hashes.iter().enumerate().filter_map(|(i, h)| if i % 20 == 0 { Some(h.clone()) } else { None }).collect();
+		bc.reset_to(heads);
+		assert!(!bc.is_empty());
+		assert_eq!(hashes[0], bc.heads[0]);
+		assert_eq!(hashes[0], bc.head.unwrap());
+		assert!(bc.needed_bodies(1, false).is_empty());
+		assert!(!bc.contains(&hashes[0]));
+		assert!(!bc.is_downloading(&hashes[0]));
+
+		let (h, n) = bc.needed_headers(6, false).unwrap();
+		assert!(bc.is_downloading(&hashes[0]));
+		assert_eq!(hashes[0], h);
+		assert_eq!(n, 6);
+		assert_eq!(bc.downloading_headers.len(), 1);
+		assert!(bc.drain().is_empty());
+
+		bc.insert_headers(headers[0..6].to_vec());
+		assert_eq!(hashes[5], bc.heads[0]);
+		assert_eq!(hashes[0], bc.head.unwrap());
+		assert_eq!(bc.downloading_headers.len(), 0);
+		assert!(!bc.is_downloading(&hashes[0]));
+		assert!(bc.contains(&hashes[0]));
+
+		assert_eq!(&bc.drain()[..], &blocks[0..5]);
+		assert!(!bc.contains(&hashes[0]));
+
+		let (h, _) = bc.needed_headers(6, false).unwrap();
+		assert_eq!(hashes[5], h);
+		let (h, _) = bc.needed_headers(6, false).unwrap();
+		assert_eq!(hashes[20], h);
+		bc.insert_headers(headers[10..16].to_vec());
+		assert!(bc.drain().is_empty());
+		bc.insert_headers(headers[5..10].to_vec());
+		assert_eq!(&bc.drain()[..], &blocks[5..15]);
+		assert_eq!(hashes[15], bc.heads[0]);
+
+		bc.insert_headers(headers[16..].to_vec());
+		bc.drain();
+		assert!(bc.is_empty());
 	}
 }
 
