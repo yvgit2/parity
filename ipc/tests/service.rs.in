@@ -15,10 +15,41 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::RwLock;
+use std::ops::*;
+use std::convert::*;
+use ipc::IpcConfig;
+use util::bytes::{FromRawBytes, BytesConvertable, FromBytesError};
 
 pub struct Service {
 	pub commits: RwLock<usize>,
 	pub rollbacks: RwLock<usize>,
+}
+
+pub struct CustomData {
+	pub a: usize,
+	pub b: usize,
+}
+
+impl FromRawBytes for CustomData {
+	fn from_bytes(bytes: &[u8]) -> Result<CustomData, FromBytesError> {
+		Ok(CustomData {
+			a: bytes[0] as usize * 256 + bytes[1] as usize,
+			b: bytes[2] as usize * 256 + bytes[3] as usize
+		})
+	}
+}
+
+impl BytesConvertable for CustomData {
+	fn bytes(&self) -> &[u8] {
+		let ip: *const CustomData = self;
+    	let ptr: *const u8 = ip as *const _;
+		unsafe {
+    		::std::slice::from_raw_parts(
+        		ptr,
+        		::std::mem::size_of::<CustomData>()
+    		)
+		}
+	}
 }
 
 #[derive(Ipc)]
@@ -28,10 +59,20 @@ impl Service {
 		*lock = *lock + f as usize;
 		f
 	}
-	pub fn rollback(&self, a: u32, b: u32) -> i32 {
+	pub fn rollback(&self, a: Option<u32>, b: u32) -> i32 {
+		let a_0 = a.unwrap_or_else(|| 0);
 		let mut lock = self.rollbacks.write().unwrap();
-		*lock = *lock + a as usize - b as usize;
-		(a - b) as i32
+		*lock = *lock + a_0 as usize - b as usize;
+		(a_0 - b) as i32
+	}
+	pub fn push_custom(&self, data: CustomData) -> bool {
+		let mut clock = self.commits.write().unwrap();
+		let mut rlock = self.commits.write().unwrap();
+
+		*clock = data.a;
+		*rlock = data.b;
+
+		true
 	}
 }
 
@@ -43,3 +84,5 @@ impl Service {
 		}
 	}
 }
+
+impl ::ipc::IpcConfig for Service {}

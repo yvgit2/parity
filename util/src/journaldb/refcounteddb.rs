@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Disk-backed, ref-counted JournalDB implementation.
+//! Disk-backed, ref-counted `JournalDB` implementation.
 
 use common::*;
 use rlp::*;
@@ -25,11 +25,11 @@ use kvdb::{Database, DBTransaction, DatabaseConfig};
 #[cfg(test)]
 use std::env;
 
-/// Implementation of the HashDB trait for a disk-backed database with a memory overlay
+/// Implementation of the `HashDB` trait for a disk-backed database with a memory overlay
 /// and latent-removal semantics.
 ///
-/// Like OverlayDB, there is a memory overlay; `commit()` must be called in order to
-/// write operations out to disk. Unlike OverlayDB, `remove()` operations do not take effect
+/// Like `OverlayDB`, there is a memory overlay; `commit()` must be called in order to
+/// write operations out to disk. Unlike `OverlayDB`, `remove()` operations do not take effect
 /// immediately. Rather some age (based on a linear but arbitrary metric) must pass before
 /// the removals actually take effect.
 pub struct RefCountedDB {
@@ -42,7 +42,7 @@ pub struct RefCountedDB {
 
 const LATEST_ERA_KEY : [u8; 12] = [ b'l', b'a', b's', b't', 0, 0, 0, 0, 0, 0, 0, 0 ];
 const VERSION_KEY : [u8; 12] = [ b'j', b'v', b'e', b'r', 0, 0, 0, 0, 0, 0, 0, 0 ];
-const DB_VERSION : u32 = 512;
+const DB_VERSION : u32 = 0x200;
 const PADDING : [u8; 10] = [ 0u8; 10 ];
 
 impl RefCountedDB {
@@ -57,7 +57,7 @@ impl RefCountedDB {
 		if !backing.is_empty() {
 			match backing.get(&VERSION_KEY).map(|d| d.map(|v| decode::<u32>(&v))) {
 				Ok(Some(DB_VERSION)) => {},
-				v => panic!("Incompatible DB version, expected {}, got {:?}", DB_VERSION, v)
+				v => panic!("Incompatible DB version, expected {}, got {:?}; to resolve, remove {} and restart.", DB_VERSION, v, path)
 			}
 		} else {
 			backing.put(&VERSION_KEY, &encode(&DB_VERSION)).expect("Error writing version to database");
@@ -111,6 +111,8 @@ impl JournalDB for RefCountedDB {
 	fn is_empty(&self) -> bool {
 		self.latest_era.is_none()
 	}
+
+	fn latest_era(&self) -> Option<u64> { self.latest_era }
 
 	fn commit(&mut self, now: u64, id: &H256, end: Option<(u64, H256)>) -> Result<u32, UtilError> {
 		// journal format:
@@ -195,6 +197,7 @@ impl JournalDB for RefCountedDB {
 #[cfg(test)]
 mod tests {
 	#![cfg_attr(feature="dev", allow(blacklisted_name))]
+	#![cfg_attr(feature="dev", allow(similar_names))]
 
 	use common::*;
 	use super::*;
@@ -217,6 +220,25 @@ mod tests {
 		assert!(jdb.exists(&h));
 		jdb.commit(4, &b"4".sha3(), Some((1, b"1".sha3()))).unwrap();
 		assert!(!jdb.exists(&h));
+	}
+
+	#[test]
+	fn latest_era_should_work() {
+		// history is 3
+		let mut jdb = RefCountedDB::new_temp();
+		assert_eq!(jdb.latest_era(), None);
+		let h = jdb.insert(b"foo");
+		jdb.commit(0, &b"0".sha3(), None).unwrap();
+		assert_eq!(jdb.latest_era(), Some(0));
+		jdb.remove(&h);
+		jdb.commit(1, &b"1".sha3(), None).unwrap();
+		assert_eq!(jdb.latest_era(), Some(1));
+		jdb.commit(2, &b"2".sha3(), None).unwrap();
+		assert_eq!(jdb.latest_era(), Some(2));
+		jdb.commit(3, &b"3".sha3(), Some((0, b"0".sha3()))).unwrap();
+		assert_eq!(jdb.latest_era(), Some(3));
+		jdb.commit(4, &b"4".sha3(), Some((1, b"1".sha3()))).unwrap();
+		assert_eq!(jdb.latest_era(), Some(4));
 	}
 
 	#[test]

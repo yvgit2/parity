@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Disk-backed HashDB implementation.
+//! Disk-backed `HashDB` implementation.
 
 use common::*;
 use rlp::*;
@@ -53,11 +53,11 @@ enum RemoveFrom {
 	Archive,
 }
 
-/// Implementation of the HashDB trait for a disk-backed database with a memory overlay
+/// Implementation of the `HashDB` trait for a disk-backed database with a memory overlay
 /// and latent-removal semantics.
 ///
-/// Like OverlayDB, there is a memory overlay; `commit()` must be called in order to
-/// write operations out to disk. Unlike OverlayDB, `remove()` operations do not take effect
+/// Like `OverlayDB`, there is a memory overlay; `commit()` must be called in order to
+/// write operations out to disk. Unlike `OverlayDB`, `remove()` operations do not take effect
 /// immediately. Rather some age (based on a linear but arbitrary metric) must pass before
 /// the removals actually take effect.
 pub struct EarlyMergeDB {
@@ -70,7 +70,7 @@ pub struct EarlyMergeDB {
 // all keys must be at least 12 bytes
 const LATEST_ERA_KEY : [u8; 12] = [ b'l', b'a', b's', b't', 0, 0, 0, 0, 0, 0, 0, 0 ];
 const VERSION_KEY : [u8; 12] = [ b'j', b'v', b'e', b'r', 0, 0, 0, 0, 0, 0, 0, 0 ];
-const DB_VERSION : u32 = 3;
+const DB_VERSION : u32 = 0x003;
 const PADDING : [u8; 10] = [ 0u8; 10 ];
 
 impl EarlyMergeDB {
@@ -85,7 +85,7 @@ impl EarlyMergeDB {
 		if !backing.is_empty() {
 			match backing.get(&VERSION_KEY).map(|d| d.map(|v| decode::<u32>(&v))) {
 				Ok(Some(DB_VERSION)) => {},
-				v => panic!("Incompatible DB version, expected {}, got {:?}", DB_VERSION, v)
+				v => panic!("Incompatible DB version, expected {}, got {:?}; to resolve, remove {} and restart.", DB_VERSION, v, path)
 			}
 		} else {
 			backing.put(&VERSION_KEY, &encode(&DB_VERSION)).expect("Error writing version to database");
@@ -333,13 +333,14 @@ impl JournalDB for EarlyMergeDB {
 		self.backing.get(&LATEST_ERA_KEY).expect("Low level database error").is_none()
 	}
 
+	fn latest_era(&self) -> Option<u64> { self.latest_era }
+
 	fn mem_used(&self) -> usize {
 		self.overlay.mem_used() + match self.refs {
 			Some(ref c) => c.read().unwrap().heap_size_of_children(),
 			None => 0
 		}
  	}
-
 
 	#[cfg_attr(feature="dev", allow(cyclomatic_complexity))]
 	fn commit(&mut self, now: u64, id: &H256, end: Option<(u64, H256)>) -> Result<u32, UtilError> {
@@ -528,6 +529,7 @@ impl JournalDB for EarlyMergeDB {
 #[cfg(test)]
 mod tests {
 	#![cfg_attr(feature="dev", allow(blacklisted_name))]
+	#![cfg_attr(feature="dev", allow(similar_names))]
 
 	use common::*;
 	use super::*;

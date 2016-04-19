@@ -17,6 +17,7 @@
 //! Blockchain database client.
 
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use util::*;
 use util::panics::*;
 use views::BlockView;
@@ -30,7 +31,7 @@ use service::{NetSyncMessage, SyncMessage};
 use env_info::LastHashes;
 use verification::*;
 use block::*;
-use transaction::{LocalizedTransaction, SignedTransaction};
+use transaction::{LocalizedTransaction, SignedTransaction, Action};
 use extras::TransactionAddress;
 use filter::Filter;
 use log_entry::LocalizedLogEntry;
@@ -38,7 +39,7 @@ use block_queue::{BlockQueue, BlockQueueInfo};
 use blockchain::{BlockChain, BlockProvider, TreeRoute, ImportRoute};
 use client::{BlockId, TransactionId, UncleId, ClientConfig, BlockChainClient};
 use env_info::EnvInfo;
-use executive::{Executive, Executed};
+use executive::{Executive, Executed, TransactOptions, contract_address};
 use receipt::LocalizedReceipt;
 pub use blockchain::CacheSize as BlockChainCacheSize;
 
@@ -126,27 +127,37 @@ impl Client<CanonVerifier> {
 	}
 }
 
+/// Get the path for the databases given the root path and information on the databases.
+pub fn get_db_path(path: &Path, pruning: journaldb::Algorithm, genesis_hash: H256) -> PathBuf {
+	let mut dir = path.to_path_buf();
+	dir.push(H64::from(genesis_hash).hex());
+	//TODO: sec/fat: pruned/full versioning
+	// version here is a bit useless now, since it's controlled only be the pruning algo.
+	dir.push(format!("v{}-sec-{}", CLIENT_DB_VER_STR, pruning));
+	dir
+}
+
+/// Append a path element to the given path and return the string.
+pub fn append_path(path: &Path, item: &str) -> String {
+	let mut p = path.to_path_buf();
+	p.push(item);
+	p.to_str().unwrap().to_owned()
+}
+
 impl<V> Client<V> where V: Verifier {
 	///  Create a new client with given spec and DB path and custom verifier.
 	pub fn new_with_verifier(config: ClientConfig, spec: Spec, path: &Path, message_channel: IoChannel<NetSyncMessage> ) -> Result<Arc<Client<V>>, Error> {
-		let mut dir = path.to_path_buf();
-		dir.push(H64::from(spec.genesis_header().hash()).hex());
-		//TODO: sec/fat: pruned/full versioning
-		// version here is a bit useless now, since it's controlled only be the pruning algo.
-		dir.push(format!("v{}-sec-{}", CLIENT_DB_VER_STR, config.pruning));
-		let path = dir.as_path();
+		let path = get_db_path(path, config.pruning, spec.genesis_header().hash());
 		let gb = spec.genesis_block();
-		let chain = Arc::new(BlockChain::new(config.blockchain, &gb, path));
-		let mut state_path = path.to_path_buf();
-		state_path.push("state");
+		let chain = Arc::new(BlockChain::new(config.blockchain, &gb, &path));
 
-		let engine = Arc::new(try!(spec.to_engine()));
-		let state_path_str = state_path.to_str().unwrap();
-		let mut state_db = journaldb::new(state_path_str, config.pruning);
+		let mut state_db = journaldb::new(&append_path(&path, "state"), config.pruning);
 
-		if state_db.is_empty() && engine.spec().ensure_db_good(state_db.as_hashdb_mut()) {
-			state_db.commit(0, &engine.spec().genesis_header().hash(), None).expect("Error commiting genesis state to state DB");
+		if state_db.is_empty() && spec.ensure_db_good(state_db.as_hashdb_mut()) {
+			state_db.commit(0, &spec.genesis_header().hash(), None).expect("Error commiting genesis state to state DB");
 		}
+
+		let engine = Arc::new(spec.engine);
 
 		let block_queue = BlockQueue::new(config.queue, engine.clone(), message_channel);
 		let panic_handler = PanicHandler::new_in_arc();
@@ -418,7 +429,8 @@ impl<V> BlockChainClient for Client<V> where V: Verifier {
 		// give the sender max balance
 		state.sub_balance(&sender, &balance);
 		state.add_balance(&sender, &U256::max_value());
-		Executive::new(&mut state, &env_info, self.engine.deref().deref()).transact(t, false)
+		let options = TransactOptions { tracing: false, check_nonce: false };
+		Executive::new(&mut state, &env_info, self.engine.deref().deref()).transact(t, options)
 	}
 
 	// TODO [todr] Should be moved to miner crate eventually.
@@ -577,8 +589,10 @@ impl<V> BlockChainClient for Client<V> where V: Verifier {
 						// TODO: to fix this, query all previous transaction receipts and retrieve their gas usage
 						cumulative_gas_used: receipt.gas_used,
 						gas_used: receipt.gas_used,
-						// TODO: to fix this, store created contract address in db
-						contract_address: None,
+						contract_address: match tx.action {
+							Action::Call(_) => None,
+							Action::Create => Some(contract_address(&tx.sender().unwrap(), &tx.nonce))
+						},
 						logs: receipt.logs.into_iter().enumerate().map(|(i, log)| LocalizedLogEntry {
 							entry: log,
 							block_hash: block_hash.clone(),

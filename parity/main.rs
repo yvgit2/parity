@@ -19,6 +19,7 @@
 #![warn(missing_docs)]
 #![cfg_attr(feature="dev", feature(plugin))]
 #![cfg_attr(feature="dev", plugin(clippy))]
+#![cfg_attr(feature="dev", allow(useless_format))]
 extern crate docopt;
 extern crate num_cpus;
 extern crate rustc_serialize;
@@ -35,12 +36,19 @@ extern crate daemonize;
 extern crate time;
 extern crate number_prefix;
 extern crate rpassword;
+extern crate semver;
+extern crate ethcore_ipc as ipc;
+extern crate ethcore_ipc_nano as nanoipc;
+extern crate serde;
+extern crate bincode;
 
 // for price_info.rs
 #[macro_use] extern crate hyper;
 
 #[cfg(feature = "rpc")]
 extern crate ethcore_rpc as rpc;
+#[cfg(feature = "webapp")]
+extern crate ethcore_webapp as webapp;
 
 use std::io::{BufRead, BufReader};
 use std::fs::File;
@@ -62,8 +70,14 @@ use ethminer::{Miner, MinerService};
 use docopt::Docopt;
 use daemonize::Daemonize;
 use number_prefix::{binary_prefix, Standalone, Prefixed};
+#[cfg(feature = "rpc")]
+use rpc::Server as RpcServer;
+#[cfg(feature = "webapp")]
+use webapp::Server as WebappServer;
 
 mod price_info;
+mod upgrade;
+mod hypervisor;
 
 fn die_with_message(msg: &str) -> ! {
 	println!("ERROR: {}", msg);
@@ -82,7 +96,7 @@ Parity. Ethereum Client.
 
 Usage:
   parity daemon <pid-file> [options]
-  parity account (new | list)
+  parity account (new | list) [options]
   parity [options]
 
 Protocol Options:
@@ -93,11 +107,12 @@ Protocol Options:
   -d --db-path PATH        Specify the database & configuration directory path
                            [default: $HOME/.parity].
   --keys-path PATH         Specify the path for JSON key files to be found
-                           [default: $HOME/.web3/keys].
+                           [default: $HOME/.parity/keys].
   --identity NAME          Specify your node's name.
 
 Account Options:
-  --unlock ACCOUNT         Unlock ACCOUNT for the duration of the execution.
+  --unlock ACCOUNTS        Unlock ACCOUNTS for the duration of the execution.
+                           ACCOUNTS is a comma-delimited list of addresses.
   --password FILE          Provide a file containing a password for unlocking
                            an account.
 
@@ -117,20 +132,34 @@ Networking Options:
                            string or input to SHA3 operation.
 
 API and Console Options:
-  -j --jsonrpc             Enable the JSON-RPC API sever.
+  -j --jsonrpc             Enable the JSON-RPC API server.
+  --jsonrpc-port PORT      Specify the port portion of the JSONRPC API server
+                           [default: 8545].
   --jsonrpc-interface IP   Specify the hostname portion of the JSONRPC API
                            server, IP should be an interface's IP address, or
                            all (all interfaces) or local [default: local].
-  --jsonrpc-port PORT      Specify the port portion of the JSONRPC API server
-                           [default: 8545].
-  --jsonrpc-cors URL       Specify CORS header for JSON-RPC API responses
-                           [default: null].
+  --jsonrpc-cors URL       Specify CORS header for JSON-RPC API responses.
   --jsonrpc-apis APIS      Specify the APIs available through the JSONRPC
                            interface. APIS is a comma-delimited list of API
                            name. Possible name are web3, eth and net.
-                           [default: web3,eth,net,personal].
+                           [default: web3,eth,net,personal,ethcore].
+  -w --webapp              Enable the web applications server (e.g.
+                           status page).
+  --webapp-port PORT       Specify the port portion of the WebApps server
+                           [default: 8080].
+  --webapp-interface IP    Specify the hostname portion of the WebApps
+                           server, IP should be an interface's IP address, or
+                           all (all interfaces) or local [default: local].
+  --webapp-user USERNAME   Specify username for WebApps server. It will be
+                           used in HTTP Basic Authentication Scheme.
+                           If --webapp-pass is not specified you will be
+                           asked for password on startup.
+  --webapp-pass PASSWORD   Specify password for WebApps server. Use only in
+                           conjunction with --webapp-user.
 
 Sealing/Mining Options:
+  --force-sealing          Force the node to author new blocks as if it were
+                           always sealing/mining.
   --usd-per-tx USD         Amount of USD to be paid for a basic transaction
                            [default: 0.005]. The minimum gas price is set
                            accordingly.
@@ -146,8 +175,14 @@ Sealing/Mining Options:
 
 Footprint Options:
   --pruning METHOD         Configure pruning of the state/storage trie. METHOD
-                           may be one of: archive, basic (experimental), fast
-                           (experimental) [default: archive].
+                           may be one of auto, archive, basic, fast, light:
+                           archive - keep all state trie data. No pruning.
+                           basic - reference count in disk DB. Slow but light.
+                           fast - maintain journal overlay. Fast but 50MB used.
+                           light - early merges with partial tracking. Fast
+                           and light. Experimental!
+                           auto - use the method most recently synced or
+                           default to archive if none synced [default: auto].
   --cache-pref-size BYTES  Specify the prefered size of the blockchain cache in
                            bytes [default: 16384].
   --cache-max-size BYTES   Specify the maximum size of the blockchain cache in
@@ -193,7 +228,7 @@ struct Args {
 	flag_chain: String,
 	flag_db_path: String,
 	flag_identity: String,
-	flag_unlock: Vec<String>,
+	flag_unlock: Option<String>,
 	flag_password: Vec<String>,
 	flag_cache: Option<usize>,
 	flag_keys_path: String,
@@ -211,8 +246,14 @@ struct Args {
 	flag_jsonrpc: bool,
 	flag_jsonrpc_interface: String,
 	flag_jsonrpc_port: u16,
-	flag_jsonrpc_cors: String,
+	flag_jsonrpc_cors: Option<String>,
 	flag_jsonrpc_apis: String,
+	flag_webapp: bool,
+	flag_webapp_port: u16,
+	flag_webapp_interface: String,
+	flag_webapp_user: Option<String>,
+	flag_webapp_pass: Option<String>,
+	flag_force_sealing: bool,
 	flag_author: String,
 	flag_usd_per_tx: String,
 	flag_usd_per_eth: String,
@@ -269,10 +310,10 @@ fn setup_rpc_server(
 	sync: Arc<EthSync>,
 	secret_store: Arc<AccountService>,
 	miner: Arc<Miner>,
-	url: &str,
-	cors_domain: &str,
-	apis: Vec<&str>
-) -> Option<Arc<PanicHandler>> {
+	url: &SocketAddr,
+	cors_domain: Option<String>,
+	apis: Vec<&str>,
+) -> RpcServer {
 	use rpc::v1::*;
 
 	let server = rpc::RpcServer::new();
@@ -283,15 +324,58 @@ fn setup_rpc_server(
 			"eth" => {
 				server.add_delegate(EthClient::new(&client, &sync, &secret_store, &miner).to_delegate());
 				server.add_delegate(EthFilterClient::new(&client, &miner).to_delegate());
-			}
+			},
 			"personal" => server.add_delegate(PersonalClient::new(&secret_store).to_delegate()),
+			"ethcore" => server.add_delegate(EthcoreClient::new(&miner).to_delegate()),
 			_ => {
 				die!("{}: Invalid API name to be enabled.", api);
-			}
+			},
 		}
 	}
-	Some(server.start_http(url, cors_domain, ::num_cpus::get()))
+	let start_result = server.start_http(url, cors_domain);
+	match start_result {
+		Err(rpc::RpcServerError::IoError(err)) => die_with_io_error(err),
+		Err(e) => die!("{:?}", e),
+		Ok(server) => server,
+	}
 }
+
+#[cfg(feature = "webapp")]
+fn setup_webapp_server(
+	client: Arc<Client>,
+	sync: Arc<EthSync>,
+	secret_store: Arc<AccountService>,
+	miner: Arc<Miner>,
+	url: &SocketAddr,
+	auth: Option<(String, String)>,
+) -> WebappServer {
+	use rpc::v1::*;
+
+	let server = webapp::ServerBuilder::new();
+	server.add_delegate(Web3Client::new().to_delegate());
+	server.add_delegate(NetClient::new(&sync).to_delegate());
+	server.add_delegate(EthClient::new(&client, &sync, &secret_store, &miner).to_delegate());
+	server.add_delegate(EthFilterClient::new(&client, &miner).to_delegate());
+	server.add_delegate(PersonalClient::new(&secret_store).to_delegate());
+	server.add_delegate(EthcoreClient::new(&miner).to_delegate());
+	let start_result = match auth {
+		None => {
+			server.start_unsecure_http(url)
+		},
+		Some((username, password)) => {
+			server.start_basic_auth_http(url, &username, &password)
+		},
+	};
+	match start_result {
+		Err(webapp::ServerError::IoError(err)) => die_with_io_error(err),
+		Err(e) => die!("{:?}", e),
+		Ok(handle) => handle,
+	}
+
+}
+
+#[cfg(not(feature = "rpc"))]
+struct RpcServer;
 
 #[cfg(not(feature = "rpc"))]
 fn setup_rpc_server(
@@ -299,11 +383,26 @@ fn setup_rpc_server(
 	_sync: Arc<EthSync>,
 	_secret_store: Arc<AccountService>,
 	_miner: Arc<Miner>,
-	_url: &str,
-	_cors_domain: &str,
-	_apis: Vec<&str>
-) -> Option<Arc<PanicHandler>> {
-	None
+	_url: &SocketAddr,
+	_cors_domain: Option<String>,
+	_apis: Vec<&str>,
+) -> ! {
+	die!("Your Parity version has been compiled without JSON-RPC support.")
+}
+
+#[cfg(not(feature = "webapp"))]
+struct WebappServer;
+
+#[cfg(not(feature = "webapp"))]
+fn setup_webapp_server(
+	_client: Arc<Client>,
+	_sync: Arc<EthSync>,
+	_secret_store: Arc<AccountService>,
+	_miner: Arc<Miner>,
+	_url: &SocketAddr,
+	_auth: Option<(String, String)>,
+) -> ! {
+	die!("Your Parity version has been compiled without WebApps support.")
 }
 
 fn print_version() {
@@ -338,7 +437,7 @@ impl Configuration {
 	fn author(&self) -> Address {
 		let d = self.args.flag_etherbase.as_ref().unwrap_or(&self.args.flag_author);
 		Address::from_str(clean_0x(d)).unwrap_or_else(|_| {
-			die!("{}: Invalid address for --author. Must be 40 hex characters, without the 0x at the beginning.", d)
+			die!("{}: Invalid address for --author. Must be 40 hex characters, with or without the 0x at the beginning.", d)
 		})
 	}
 
@@ -361,9 +460,9 @@ impl Configuration {
 					die!("{}: Invalid basic transaction price given in USD. Must be a decimal number.", self.args.flag_usd_per_tx)
 				});
 				let usd_per_eth = match self.args.flag_usd_per_eth.as_str() {
-					"etherscan" => price_info::PriceInfo::get().map(|x| x.ethusd).unwrap_or_else(|| {
+					"etherscan" => price_info::PriceInfo::get().map_or_else(|| {
 						die!("Unable to retrieve USD value of ETH from etherscan. Rerun with a different value for --usd-per-eth.")
-					}),
+					}, |x| x.ethusd),
 					x => FromStr::from_str(x).unwrap_or_else(|_| die!("{}: Invalid ether price given in USD. Must be a decimal number.", x))
 				};
 				let wei_per_usd: f32 = 1.0e18 / usd_per_eth;
@@ -383,7 +482,7 @@ impl Configuration {
 		}
 	}
 
-	fn _keys_path(&self) -> String {
+	fn keys_path(&self) -> String {
 		self.args.flag_keys_path.replace("$HOME", env::home_dir().unwrap().to_str().unwrap())
 	}
 
@@ -395,7 +494,7 @@ impl Configuration {
 			"frontier" | "homestead" | "mainnet" => ethereum::new_frontier(),
 			"morden" | "testnet" => ethereum::new_morden(),
 			"olympic" => ethereum::new_olympic(),
-			f => Spec::from_json_utf8(contents(f).unwrap_or_else(|_| {
+			f => Spec::load(contents(f).unwrap_or_else(|_| {
 				die!("{}: Couldn't read chain specification file. Sure it exists?", f)
 			}).as_ref()),
 		}
@@ -421,7 +520,6 @@ impl Configuration {
 		}
 	}
 
-	#[cfg_attr(feature="dev", allow(useless_format))]
 	fn net_addresses(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
 		let listen_address = Some(SocketAddr::new(IpAddr::from_str("0.0.0.0").unwrap(), self.args.flag_port));
 		let public_address = if self.args.flag_nat.starts_with("extip:") {
@@ -450,8 +548,26 @@ impl Configuration {
 		ret
 	}
 
-	#[cfg_attr(feature="dev", allow(useless_format))]
-	fn client_config(&self) -> ClientConfig {
+	fn find_best_db(&self, spec: &Spec) -> Option<journaldb::Algorithm> {
+		let mut ret = None;
+		let mut latest_era = None;
+		let jdb_types = [journaldb::Algorithm::Archive, journaldb::Algorithm::EarlyMerge, journaldb::Algorithm::OverlayRecent, journaldb::Algorithm::RefCounted];
+		for i in jdb_types.into_iter() {
+			let db = journaldb::new(&append_path(&get_db_path(&Path::new(&self.path()), *i, spec.genesis_header().hash()), "state"), *i);
+			trace!(target: "parity", "Looking for best DB: {} at {:?}", i, db.latest_era());
+			match (latest_era, db.latest_era()) {
+				(Some(best), Some(this)) if best >= this => {}
+				(_, None) => {}
+				(_, Some(this)) => {
+					latest_era = Some(this);
+					ret = Some(*i);
+				}
+			}
+		}
+		ret
+	}
+
+	fn client_config(&self, spec: &Spec) -> ClientConfig {
 		let mut client_config = ClientConfig::default();
 		match self.args.flag_cache {
 			Some(mb) => {
@@ -468,8 +584,10 @@ impl Configuration {
 			"light" => journaldb::Algorithm::EarlyMerge,
 			"fast" => journaldb::Algorithm::OverlayRecent,
 			"basic" => journaldb::Algorithm::RefCounted,
+			"auto" => self.find_best_db(spec).unwrap_or(journaldb::Algorithm::OverlayRecent),
 			_ => { die!("Invalid pruning method given."); }
 		};
+		trace!(target: "parity", "Using pruning strategy of {}", client_config.pruning);
 		client_config.name = self.args.flag_identity.clone();
 		client_config.queue.max_mem_use = self.args.flag_queue_max_size;
 		client_config
@@ -488,6 +606,18 @@ impl Configuration {
 			print_version();
 			return;
 		}
+
+		match ::upgrade::upgrade(Some(&self.path())) {
+			Ok(upgrades_applied) => {
+				if upgrades_applied > 0 {
+					println!("Executed {} upgrade scripts - ok", upgrades_applied);
+				}
+			},
+			Err(e) => {
+				die!("Error upgrading parity data: {:?}", e);
+			}
+		}
+
 		if self.args.cmd_daemon {
 			Daemonize::new()
 				.pid_file(self.args.arg_pid_file.clone())
@@ -505,12 +635,12 @@ impl Configuration {
 	fn execute_account_cli(&self) {
 		use util::keys::store::SecretStore;
 		use rpassword::read_password;
-		let mut secret_store = SecretStore::new();
+		let mut secret_store = SecretStore::new_in(Path::new(&self.keys_path()));
 		if self.args.cmd_new {
 			println!("Please note that password is NOT RECOVERABLE.");
-			println!("Type password: ");
+			print!("Type password: ");
 			let password = read_password().unwrap();
-			println!("Repeat password: ");
+			print!("Repeat password: ");
 			let password_repeat = read_password().unwrap();
 			if password != password_repeat {
 				println!("Passwords do not match!");
@@ -538,20 +668,20 @@ impl Configuration {
 				.collect::<Vec<_>>()
 				.into_iter()
 		}).collect::<Vec<_>>();
-
-		let account_service = AccountService::new();
-		for d in &self.args.flag_unlock {
-			let a = Address::from_str(clean_0x(&d)).unwrap_or_else(|_| {
-				die!("{}: Invalid address for --unlock. Must be 40 hex characters, without the 0x at the beginning.", d)
-			});
-			if passwords.iter().find(|p| account_service.unlock_account_no_expire(&a, p).is_ok()).is_none() {
-				die!("No password given to unlock account {}. Pass the password using `--password`.", a);
+		let account_service = AccountService::new_in(Path::new(&self.keys_path()));
+		if let Some(ref unlocks) = self.args.flag_unlock {
+			for d in unlocks.split(',') {
+				let a = Address::from_str(clean_0x(&d)).unwrap_or_else(|_| {
+					die!("{}: Invalid address for --unlock. Must be 40 hex characters, without the 0x at the beginning.", d)
+				});
+				if passwords.iter().find(|p| account_service.unlock_account_no_expire(&a, p).is_ok()).is_none() {
+					die!("No password given to unlock account {}. Pass the password using `--password`.", a);
+				}
 			}
 		}
 		account_service
 	}
 
-	#[cfg_attr(feature="dev", allow(useless_format))]
 	fn execute_client(&self) {
 		// Setup panic handler
 		let panic_handler = PanicHandler::new_in_arc();
@@ -564,17 +694,21 @@ impl Configuration {
 		let spec = self.spec();
 		let net_settings = self.net_settings(&spec);
 		let sync_config = self.sync_config(&spec);
+		let client_config = self.client_config(&spec);
 
 		// Secret Store
 		let account_service = Arc::new(self.account_service());
 
 		// Build client
-		let mut service = ClientService::start(self.client_config(), spec, net_settings, &Path::new(&self.path())).unwrap();
+		let mut service = ClientService::start(
+			client_config, spec, net_settings, &Path::new(&self.path())
+		).unwrap_or_else(|e| die_with_error(e));
+
 		panic_handler.forward_from(&service);
 		let client = service.client();
 
 		// Miner
-		let miner = Miner::new();
+		let miner = Miner::new(self.args.flag_force_sealing);
 		miner.set_author(self.author());
 		miner.set_gas_floor_target(self.gas_floor_target());
 		miner.set_extra_data(self.extra_data());
@@ -584,7 +718,8 @@ impl Configuration {
 		let sync = EthSync::register(service.network(), sync_config, client.clone(), miner.clone());
 
 		// Setup rpc
-		if self.args.flag_jsonrpc || self.args.flag_rpc {
+		let rpc_server = if self.args.flag_jsonrpc || self.args.flag_rpc {
+			let apis = self.args.flag_rpcapi.as_ref().unwrap_or(&self.args.flag_jsonrpc_apis);
 			let url = format!("{}:{}",
 				match self.args.flag_rpcaddr.as_ref().unwrap_or(&self.args.flag_jsonrpc_interface).as_str() {
 					"all" => "0.0.0.0",
@@ -593,23 +728,54 @@ impl Configuration {
 				},
 				self.args.flag_rpcport.unwrap_or(self.args.flag_jsonrpc_port)
 			);
-			SocketAddr::from_str(&url).unwrap_or_else(|_| die!("{}: Invalid JSONRPC listen host/port given.", url));
-			let cors = self.args.flag_rpccorsdomain.as_ref().unwrap_or(&self.args.flag_jsonrpc_cors);
-			// TODO: use this as the API list.
-			let apis = self.args.flag_rpcapi.as_ref().unwrap_or(&self.args.flag_jsonrpc_apis);
-			let server_handler = setup_rpc_server(
+			let addr = SocketAddr::from_str(&url).unwrap_or_else(|_| die!("{}: Invalid JSONRPC listen host/port given.", url));
+			let cors_domain = self.args.flag_jsonrpc_cors.clone().or(self.args.flag_rpccorsdomain.clone());
+
+			Some(setup_rpc_server(
 				service.client(),
 				sync.clone(),
 				account_service.clone(),
 				miner.clone(),
-				&url,
-				cors,
+				&addr,
+				cors_domain,
 				apis.split(',').collect()
+			))
+		} else {
+			None
+		};
+
+		let webapp_server = if self.args.flag_webapp {
+			let url = format!("{}:{}",
+				match self.args.flag_webapp_interface.as_str() {
+					"all" => "0.0.0.0",
+					"local" => "127.0.0.1",
+					x => x,
+				},
+				self.args.flag_webapp_port
 			);
-			if let Some(handler) = server_handler {
-				panic_handler.forward_from(handler.deref());
-			}
-		}
+			let addr = SocketAddr::from_str(&url).unwrap_or_else(|_| die!("{}: Invalid Webapps listen host/port given.", url));
+			let auth = self.args.flag_webapp_user.as_ref().map(|username| {
+				let password = self.args.flag_webapp_pass.as_ref().map_or_else(|| {
+					use rpassword::read_password;
+					println!("Type password for WebApps server (user: {}): ", username);
+					let pass = read_password().unwrap();
+					println!("OK, got it. Starting server...");
+					pass
+				}, |pass| pass.to_owned());
+				(username.to_owned(), password)
+			});
+
+			Some(setup_webapp_server(
+				service.client(),
+				sync.clone(),
+				account_service.clone(),
+				miner.clone(),
+				&addr,
+				auth,
+			))
+		} else {
+			None
+		};
 
 		// Register IO handler
 		let io_handler  = Arc::new(ClientIoHandler {
@@ -621,11 +787,11 @@ impl Configuration {
 		service.io().register_handler(io_handler).expect("Error registering IO handler");
 
 		// Handle exit
-		wait_for_exit(panic_handler);
+		wait_for_exit(panic_handler, rpc_server, webapp_server);
 	}
 }
 
-fn wait_for_exit(panic_handler: Arc<PanicHandler>) {
+fn wait_for_exit(panic_handler: Arc<PanicHandler>, _rpc_server: Option<RpcServer>, _webapp_server: Option<WebappServer>) {
 	let exit = Arc::new(Condvar::new());
 
 	// Handle possible exits
@@ -639,9 +805,34 @@ fn wait_for_exit(panic_handler: Arc<PanicHandler>) {
 	// Wait for signal
 	let mutex = Mutex::new(());
 	let _ = exit.wait(mutex.lock().unwrap()).unwrap();
+	info!("Finishing work, please wait...");
+}
+
+fn die_with_error(e: ethcore::error::Error) -> ! {
+	use ethcore::error::Error;
+
+	match e {
+		Error::Util(UtilError::StdIo(e)) => die_with_io_error(e),
+		_ => die!("{:?}", e),
+	}
+}
+fn die_with_io_error(e: std::io::Error) -> ! {
+	match e.kind() {
+		std::io::ErrorKind::PermissionDenied => {
+			die!("No permissions to bind to specified port.")
+		},
+		std::io::ErrorKind::AddrInUse => {
+			die!("Specified address is already in use. Please make sure that nothing is listening on the same port or try using a different one.")
+		},
+		std::io::ErrorKind::AddrNotAvailable => {
+			die!("Could not use specified interface or given address is invalid.")
+		},
+		_ => die!("{:?}", e),
+	}
 }
 
 fn main() {
+
 	Configuration::parse().execute();
 }
 

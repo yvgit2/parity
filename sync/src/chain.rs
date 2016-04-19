@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-/// BlockChain synchronization strategy.
+///
+/// `BlockChain` synchronization strategy.
 /// Syncs to peers and keeps up to date.
 /// This implementation uses ethereum protocol v63
 ///
@@ -173,7 +174,7 @@ pub struct SyncStatus {
 	pub protocol_version: u8,
 	/// The underlying p2p network version.
 	pub network_id: U256,
-	/// BlockChain height for the moment the sync started.
+	/// `BlockChain` height for the moment the sync started.
 	pub start_block_number: BlockNumber,
 	/// Last fully downloaded and imported block number (if any).
 	pub last_imported_block_number: Option<BlockNumber>,
@@ -324,6 +325,14 @@ impl ChainSync {
 		self.state = SyncState::ChainHead;
 	}
 
+	/// Restart sync after bad block has been detected. May end up re-downloading up to QUEUE_SIZE blocks
+	pub fn restart_on_bad_block(&mut self, io: &mut SyncIo) {
+		self.restart(io);
+		// Do not assume that the block queue/chain still has our last_imported_block
+		let chain = io.chain().chain_info();
+		self.last_imported_block = chain.best_block_number;
+		self.last_imported_hash = chain.best_block_hash;
+	}
 	/// Called by peer to report status
 	fn on_peer_status(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		let peer = PeerInfo {
@@ -736,7 +745,7 @@ impl ChainSync {
 		trace!(target: "sync", "Imported {} of {}", imported.len(), count);
 
 		if restart {
-			self.restart(io);
+			self.restart_on_bad_block(io);
 			self.continue_sync(io);
 			return;
 		}
@@ -806,6 +815,7 @@ impl ChainSync {
 			sync.disable_peer(peer_id);
 		}
 	}
+
 	/// Called when peer sends us new transactions
 	fn on_peer_transactions(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		// accepting transactions once only fully synced
@@ -1138,7 +1148,48 @@ impl ChainSync {
 		sent
 	}
 
+	/// propagates new transactions to all peers
+	fn propagate_new_transactions(&mut self, io: &mut SyncIo) -> usize {
+
+		// Early out of nobody to send to.
+		if self.peers.is_empty() {
+			return 0;
+		}
+
+		let mut transactions = self.miner.pending_transactions();
+		if transactions.is_empty() {
+			return 0;
+		}
+
+		let mut packet = RlpStream::new_list(transactions.len());
+		let tx_count = transactions.len();
+		for tx in transactions.drain(..) {
+			packet.append(&tx);
+		}
+		let rlp = packet.out();
+
+		let lucky_peers = {
+			// sqrt(x)/x scaled to max u32
+			let fraction = (self.peers.len() as f64).powf(-0.5).mul(u32::max_value() as f64).round() as u32;
+			let small = self.peers.len() < MIN_PEERS_PROPAGATION;
+			let lucky_peers = self.peers.iter()
+				.filter_map(|(&p, _)| if small || ::rand::random::<u32>() < fraction { Some(p.clone()) } else { None })
+				.collect::<Vec<_>>();
+
+			// taking at max of MAX_PEERS_PROPAGATION
+			lucky_peers.iter().cloned().take(min(lucky_peers.len(), MAX_PEERS_PROPAGATION)).collect::<Vec<PeerId>>()
+		};
+
+		let sent = lucky_peers.len();
+		for peer_id in lucky_peers {
+			self.send_packet(io, peer_id, TRANSACTIONS_PACKET, rlp.clone());
+		}
+		trace!(target: "sync", "Sent {} transactions to {} peers.", tx_count, sent);
+		sent
+	}
+
 	fn propagate_latest_blocks(&mut self, io: &mut SyncIo) {
+		self.propagate_new_transactions(io);
 		let chain_info = io.chain().chain_info();
 		if (((chain_info.best_block_number as i64) - (self.last_sent_block_number as i64)).abs() as BlockNumber) < MAX_PEER_LAG_PROPAGATION {
 			let blocks = self.propagate_blocks(&chain_info, io);
@@ -1162,6 +1213,10 @@ impl ChainSync {
 			self.miner.chain_new_blocks(io.chain(), imported, invalid, enacted, retracted);
 			// Propagate latests blocks
 			self.propagate_latest_blocks(io);
+		}
+		if !invalid.is_empty() {
+			trace!(target: "sync", "Bad blocks in the queue, restarting");
+			self.restart_on_bad_block(io);
 		}
 		// TODO [todr] propagate transactions?
 	}
@@ -1291,7 +1346,7 @@ mod tests {
 	}
 
 	fn dummy_sync_with_peer(peer_latest_hash: H256, client: &BlockChainClient) -> ChainSync {
-		let mut sync = ChainSync::new(SyncConfig::default(), Miner::new(), client);
+		let mut sync = ChainSync::new(SyncConfig::default(), Miner::new(false), client);
 		sync.peers.insert(0,
 			PeerInfo {
 				protocol_version: 0,
@@ -1509,21 +1564,34 @@ mod tests {
 		let good_blocks = vec![client.block_hash_delta_minus(2)];
 		let retracted_blocks = vec![client.block_hash_delta_minus(1)];
 
-		// Add some balance to clients
-		for h in vec![good_blocks[0], retracted_blocks[0]] {
-			let block = client.block(BlockId::Hash(h)).unwrap();
+		// Add some balance to clients and reset nonces
+		for h in &[good_blocks[0], retracted_blocks[0]] {
+			let block = client.block(BlockId::Hash(*h)).unwrap();
 			let view = BlockView::new(&block);
 			client.set_balance(view.transactions()[0].sender().unwrap(), U256::from(1_000_000_000));
+			client.set_nonce(view.transactions()[0].sender().unwrap(), U256::from(0));
 		}
 
-		let mut queue = VecDeque::new();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
 
 		// when
-		sync.chain_new_blocks(&mut io, &[], &[], &[], &good_blocks);
-		assert_eq!(sync.miner.status().transactions_in_future_queue, 0);
-		assert_eq!(sync.miner.status().transactions_in_pending_queue, 1);
-		sync.chain_new_blocks(&mut io, &good_blocks, &[], &[], &retracted_blocks);
+		{
+			let mut queue = VecDeque::new();
+			let mut io = TestIo::new(&mut client, &mut queue, None);
+			sync.chain_new_blocks(&mut io, &[], &[], &[], &good_blocks);
+			assert_eq!(sync.miner.status().transactions_in_future_queue, 0);
+			assert_eq!(sync.miner.status().transactions_in_pending_queue, 1);
+		}
+		// We need to update nonce status (because we say that the block has been imported)
+		for h in &[good_blocks[0]] {
+			let block = client.block(BlockId::Hash(*h)).unwrap();
+			let view = BlockView::new(&block);
+			client.set_nonce(view.transactions()[0].sender().unwrap(), U256::from(1));
+		}
+		{
+			let mut queue = VecDeque::new();
+			let mut io = TestIo::new(&mut client, &mut queue, None);
+			sync.chain_new_blocks(&mut io, &[], &[], &good_blocks, &retracted_blocks);
+		}
 
 		// then
 		let status = sync.miner.status();
@@ -1550,7 +1618,7 @@ mod tests {
 		sync.chain_new_blocks(&mut io, &[], &[], &[], &good_blocks);
 		assert_eq!(sync.miner.status().transactions_in_future_queue, 0);
 		assert_eq!(sync.miner.status().transactions_in_pending_queue, 0);
-		sync.chain_new_blocks(&mut io, &good_blocks, &[], &[], &retracted_blocks);
+		sync.chain_new_blocks(&mut io, &[], &[], &good_blocks, &retracted_blocks);
 
 		// then
 		let status = sync.miner.status();

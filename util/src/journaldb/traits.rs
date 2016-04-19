@@ -14,12 +14,12 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Disk-backed HashDB implementation.
+//! Disk-backed `HashDB` implementation.
 
 use common::*;
 use hashdb::*;
 
-/// A HashDB which can manage a short-term journal potentially containing many forks of mutually
+/// A `HashDB` which can manage a short-term journal potentially containing many forks of mutually
 /// exclusive actions.
 pub trait JournalDB : HashDB + Send + Sync {
 	/// Return a copy of ourself, in a box.
@@ -30,6 +30,9 @@ pub trait JournalDB : HashDB + Send + Sync {
 
 	/// Check if this database has any commits
 	fn is_empty(&self) -> bool;
+
+	/// Get the latest era in the DB. None if there isn't yet any data in there.
+	fn latest_era(&self) -> Option<u64>;
 
 	/// Commit all recent insert operations and canonical historical commits' removals from the
 	/// old era to the backing database, reverting any non-canonical historical commit's inserts.

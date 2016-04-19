@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! JournalDB interface and implementation.
+//! `JournalDB` interface and implementation.
 
 use common::*;
 
@@ -25,11 +25,11 @@ mod earlymergedb;
 mod overlayrecentdb;
 mod refcounteddb;
 
-/// Export the JournalDB trait.
+/// Export the `JournalDB` trait.
 pub use self::traits::JournalDB;
 
 /// A journal database algorithm.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Algorithm {
 	/// Keep all keys forever.
 	Archive,
@@ -70,7 +70,7 @@ impl fmt::Display for Algorithm {
 	}
 }
 
-/// Create a new JournalDB trait object.
+/// Create a new `JournalDB` trait object.
 pub fn new(path: &str, algorithm: Algorithm) -> Box<JournalDB> {
 	match algorithm {
 		Algorithm::Archive => Box::new(archivedb::ArchiveDB::new(path)),

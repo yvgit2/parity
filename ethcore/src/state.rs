@@ -16,7 +16,7 @@
 
 use common::*;
 use engine::Engine;
-use executive::Executive;
+use executive::{Executive, TransactOptions};
 use account_db::*;
 #[cfg(test)]
 #[cfg(feature = "json-tests")]
@@ -220,7 +220,8 @@ impl State {
 	pub fn apply(&mut self, env_info: &EnvInfo, engine: &Engine, t: &SignedTransaction, tracing: bool) -> ApplyResult {
 //		let old = self.to_pod();
 
-		let e = try!(Executive::new(self, env_info, engine).transact(t, tracing));
+		let options = TransactOptions { tracing: tracing, check_nonce: true };
+		let e = try!(Executive::new(self, env_info, engine).transact(t, options));
 
 		// TODO uncomment once to_pod() works correctly.
 //		trace!("Applied transaction. Diff:\n{}\n", StateDiff::diff_pod(&old, &self.to_pod()));
@@ -397,7 +398,11 @@ fn should_apply_create_transaction() {
 			value: x!(100),
 			gas: x!(77412),
 			init: vec![96, 16, 128, 96, 12, 96, 0, 57, 96, 0, 243, 0, 96, 0, 53, 84, 21, 96, 9, 87, 0, 91, 96, 32, 53, 96, 0, 53, 85],
-			result: Some((x!(3224), x!("8988167e088c87cd314df6d3c2b83da5acb93ace"), vec![96, 0, 53, 84, 21, 96, 9, 87, 0, 91, 96, 32, 53, 96, 0, 53]))
+		}),
+		result: TraceResult::Create(TraceCreateResult {
+			gas_used: U256::from(3224),
+			address: Address::from_str("8988167e088c87cd314df6d3c2b83da5acb93ace").unwrap(),
+			code: vec![96, 0, 53, 84, 21, 96, 9, 87, 0, 91, 96, 32, 53, 96, 0, 53]
 		}),
 		subs: vec![]
 	});
@@ -453,8 +458,8 @@ fn should_trace_failed_create_transaction() {
 			value: x!(100),
 			gas: x!(78792),
 			init: vec![91, 96, 0, 86],
-			result: None
 		}),
+		result: TraceResult::FailedCreate,
 		subs: vec![]
 	});
 
@@ -492,7 +497,10 @@ fn should_trace_call_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(3), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(3),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -530,7 +538,10 @@ fn should_trace_basic_call_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(0), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(0),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -547,7 +558,7 @@ fn should_not_trace_call_transaction_to_builtin() {
 
 	let mut info = EnvInfo::default();
 	info.gas_limit = x!(1_000_000);
-	let engine = Spec::new_test().to_engine().unwrap();
+	let engine = Spec::new_test().engine;
 
 	let t = Transaction {
 		nonce: x!(0),
@@ -572,7 +583,7 @@ fn should_not_trace_subcall_transaction_to_builtin() {
 
 	let mut info = EnvInfo::default();
 	info.gas_limit = x!(1_000_000);
-	let engine = Spec::new_test().to_engine().unwrap();
+	let engine = Spec::new_test().engine;
 
 	let t = Transaction {
 		nonce: x!(0),
@@ -594,7 +605,10 @@ fn should_not_trace_subcall_transaction_to_builtin() {
 			value: x!(0),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(28061), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(28_061),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -610,7 +624,7 @@ fn should_not_trace_callcode() {
 
 	let mut info = EnvInfo::default();
 	info.gas_limit = x!(1_000_000);
-	let engine = Spec::new_test().to_engine().unwrap();
+	let engine = Spec::new_test().engine;
 
 	let t = Transaction {
 		nonce: x!(0),
@@ -633,7 +647,10 @@ fn should_not_trace_callcode() {
 			value: x!(0),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(64), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(64),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -650,7 +667,7 @@ fn should_not_trace_delegatecall() {
 	let mut info = EnvInfo::default();
 	info.gas_limit = x!(1_000_000);
 	info.number = 0x789b0;
-	let engine = Spec::new_test().to_engine().unwrap();
+	let engine = Spec::new_test().engine;
 
 	println!("schedule.have_delegate_call: {:?}", engine.schedule(&info).have_delegate_call);
 
@@ -675,7 +692,10 @@ fn should_not_trace_delegatecall() {
 			value: x!(0),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(61), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(61),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -713,8 +733,8 @@ fn should_trace_failed_call_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: None
 		}),
+		result: TraceResult::FailedCall,
 		subs: vec![]
 	});
 
@@ -755,7 +775,10 @@ fn should_trace_call_with_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(69), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(69),
+			output: vec![]
 		}),
 		subs: vec![Trace {
 			depth: 1,
@@ -765,7 +788,10 @@ fn should_trace_call_with_subcall_transaction() {
 				value: x!(0),
 				gas: x!(78934),
 				input: vec![],
-				result: Some((x!(3), vec![]))
+			}),
+			result: TraceResult::Call(TraceCallResult {
+				gas_used: U256::from(3),
+				output: vec![]
 			}),
 			subs: vec![]
 		}]
@@ -805,7 +831,10 @@ fn should_trace_call_with_basic_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(31761), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(31761),
+			output: vec![]
 		}),
 		subs: vec![Trace {
 			depth: 1,
@@ -815,8 +844,8 @@ fn should_trace_call_with_basic_subcall_transaction() {
 				value: x!(69),
 				gas: x!(2300),
 				input: vec![],
-				result: Some((x!(0), vec![]))
 			}),
+			result: TraceResult::Call(TraceCallResult::default()),
 			subs: vec![]
 		}]
 	});
@@ -855,7 +884,10 @@ fn should_not_trace_call_with_invalid_basic_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(31761), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(31761),
+			output: vec![]
 		}),
 		subs: vec![]
 	});
@@ -895,7 +927,10 @@ fn should_trace_failed_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(79000), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(79_000),
+			output: vec![]
 		}),
 		subs: vec![Trace {
 			depth: 1,
@@ -905,8 +940,8 @@ fn should_trace_failed_subcall_transaction() {
 				value: x!(0),
 				gas: x!(78934),
 				input: vec![],
-				result: None
 			}),
+			result: TraceResult::FailedCall,
 			subs: vec![]
 		}]
 	});
@@ -947,7 +982,10 @@ fn should_trace_call_with_subcall_with_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(135), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(135),
+			output: vec![]
 		}),
 		subs: vec![Trace {
 			depth: 1,
@@ -957,7 +995,10 @@ fn should_trace_call_with_subcall_with_subcall_transaction() {
 				value: x!(0),
 				gas: x!(78934),
 				input: vec![],
-				result: Some((x!(69), vec![]))
+			}),
+			result: TraceResult::Call(TraceCallResult {
+				gas_used: U256::from(69),
+				output: vec![]
 			}),
 			subs: vec![Trace {
 				depth: 2,
@@ -967,7 +1008,10 @@ fn should_trace_call_with_subcall_with_subcall_transaction() {
 					value: x!(0),
 					gas: x!(78868),
 					input: vec![],
-					result: Some((x!(3), vec![]))
+				}),
+				result: TraceResult::Call(TraceCallResult {
+					gas_used: U256::from(3),
+					output: vec![]
 				}),
 				subs: vec![]
 			}]
@@ -1010,7 +1054,10 @@ fn should_trace_failed_subcall_with_subcall_transaction() {
 			value: x!(100),
 			gas: x!(79000),
 			input: vec![],
-			result: Some((x!(79000), vec![]))
+		}),
+		result: TraceResult::Call(TraceCallResult {
+			gas_used: U256::from(79_000),
+			output: vec![]
 		}),
 		subs: vec![Trace {
 			depth: 1,
@@ -1020,8 +1067,8 @@ fn should_trace_failed_subcall_with_subcall_transaction() {
 				value: x!(0),
 				gas: x!(78934),
 				input: vec![],
-				result: None
 			}),
+			result: TraceResult::FailedCall,
 			subs: vec![Trace {
 				depth: 2,
 				action: TraceAction::Call(TraceCall {
@@ -1030,7 +1077,10 @@ fn should_trace_failed_subcall_with_subcall_transaction() {
 					value: x!(0),
 					gas: x!(78868),
 					input: vec![],
-					result: Some((x!(3), vec![])),
+				}),
+				result: TraceResult::Call(TraceCallResult {
+					gas_used: U256::from(3),
+					output: vec![]
 				}),
 				subs: vec![]
 			}]

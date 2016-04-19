@@ -121,16 +121,10 @@ impl AccountProvider for AccountService {
 	}
 }
 
-impl Default for AccountService {
-	fn default() -> Self {
-		AccountService::new()
-	}
-}
-
 impl AccountService {
-	/// New account service with the default location
-	pub fn new() -> Self {
-		let secret_store = RwLock::new(SecretStore::new());
+	/// New account service with the keys store in specific location
+	pub fn new_in(path: &Path) -> Self {
+		let secret_store = RwLock::new(SecretStore::new_in(path));
 		secret_store.write().unwrap().try_import_existing();
 		AccountService {
 			secret_store: secret_store
@@ -150,31 +144,16 @@ impl AccountService {
 		self.secret_store.write().unwrap().collect_garbage();
 	}
 
-    /// Unlocks account for use (no expiration of unlock)
+	/// Unlocks account for use (no expiration of unlock)
 	pub fn unlock_account_no_expire(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
 		self.secret_store.write().unwrap().unlock_account_with_expiration(account, pass, None)
 	}
 }
 
-
-impl Default for SecretStore {
-	fn default() -> Self {
-		SecretStore::new()
-	}
-}
-
 impl SecretStore {
-	/// new instance of Secret Store in default home directory
-	pub fn new() -> Self {
-		let mut path = ::std::env::home_dir().expect("Failed to get home dir");
-		path.push(".parity");
-		path.push("keys");
-		::std::fs::create_dir_all(&path).expect("Should panic since it is critical to be able to access home dir");
-		Self::new_in(&path)
-	}
-
 	/// new instance of Secret Store in specific directory
 	pub fn new_in(path: &Path) -> Self {
+		::std::fs::create_dir_all(&path).expect("Cannot access requested key directory - critical");
 		SecretStore {
 			directory: KeyDirectory::new(path),
 			unlocks: RwLock::new(HashMap::new()),
@@ -183,13 +162,9 @@ impl SecretStore {
 
 	/// trys to import keys in the known locations
 	pub fn try_import_existing(&mut self) {
-		use std::path::PathBuf;
 		use keys::geth_import;
 
-		let mut import_path = PathBuf::new();
-		import_path.push(::std::env::home_dir().expect("Failed to get home dir"));
-		import_path.push(".ethereum");
-		import_path.push("keystore");
+		let import_path = geth_import::keystore_dir();
 		if let Err(e) = geth_import::import_geth_keys(self, &import_path) {
 			trace!(target: "sstore", "Geth key not imported: {:?}", e);
 		}
