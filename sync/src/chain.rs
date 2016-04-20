@@ -128,7 +128,7 @@ const MAX_HEADERS_TO_SEND: usize = 512;
 const MAX_NODE_DATA_TO_SEND: usize = 1024;
 const MAX_RECEIPTS_TO_SEND: usize = 1024;
 const MAX_RECEIPTS_HEADERS_TO_SEND: usize = 256;
-const MAX_HEADERS_TO_REQUEST: usize = 512;
+const MAX_HEADERS_TO_REQUEST: usize = 256;
 const MAX_BODIES_TO_REQUEST: usize = 256;
 const MIN_PEERS_PROPAGATION: usize = 4;
 const MAX_PEERS_PROPAGATION: usize = 128;
@@ -213,8 +213,8 @@ struct PeerInfo {
 	latest_hash: H256,
 	/// Peer best block number if known
 	latest_number: Option<BlockNumber>,
-	/// Peer total difficulty
-	difficulty: U256,
+	/// Peer total difficulty if known
+	difficulty: Option<U256>,
 	/// Type of data currenty being requested from peer.
 	asking: PeerAsking,
 	/// A set of block numbers being requested
@@ -338,7 +338,7 @@ impl ChainSync {
 		let peer = PeerInfo {
 			protocol_version: try!(r.val_at(0)),
 			network_id: try!(r.val_at(1)),
-			difficulty: try!(r.val_at(2)),
+			difficulty: Some(try!(r.val_at(2))),
 			latest_hash: try!(r.val_at(3)),
 			latest_number: None,
 			genesis: try!(r.val_at(4)),
@@ -408,6 +408,8 @@ impl ChainSync {
 						SyncState::Blocks | SyncState::NewBlocks => warn!(target: "sync", "Header already in chain {} ({})", number, hash),
 						_ => warn!(target: "sync", "Unexpected header already in chain {} ({}), state = {:?}", number, hash, self.state),
 					}
+					headers.push(try!(r.at(i)).as_raw().to_vec());
+					hashes.push(hash);
 				},
 				BlockStatus::Bad => {
 					warn!(target: "sync", "Bad header {} ({}) from {}: {}, state = {:?}", number, hash, peer_id, io.peer_info(peer_id), self.state);
@@ -531,12 +533,14 @@ impl ChainSync {
 			trace!(target: "sync", "New unknown block {:?}", h);
 			//TODO: handle too many unknown blocks
 			let difficulty: U256 = try!(r.val_at(1));
-			let peer_difficulty = self.peers.get_mut(&peer_id).unwrap().difficulty;
-			if difficulty > peer_difficulty {
-				self.state = SyncState::ChainHead;
-				trace!(target: "sync", "Received block {:?}  with no known parent. Peer needs syncing...", h);
-				self.sync_peer(io, peer_id);
+			if let Some(ref mut peer) = self.peers.get_mut(&peer_id) {
+				if peer.difficulty.map_or(true, |pd| difficulty > pd) {
+					//self.state = SyncState::ChainHead;
+					peer.difficulty = Some(difficulty);
+					trace!(target: "sync", "Received block {:?}  with no known parent. Peer needs syncing...", h);
+				}
 			}
+			self.sync_peer(io, peer_id);
 		}
 		Ok(())
 	}
@@ -608,7 +612,7 @@ impl ChainSync {
 
 	/// Resume downloading
 	fn continue_sync(&mut self, io: &mut SyncIo) {
-		let mut peers: Vec<(PeerId, U256)> = self.peers.iter().map(|(k, p)| (*k, p.difficulty)).collect();
+		let mut peers: Vec<(PeerId, U256)> = self.peers.iter().map(|(k, p)| (*k, p.difficulty.unwrap_or_else(U256::zero))).collect();
 		peers.sort_by(|&(_, d1), &(_, d2)| d1.cmp(&d2).reverse()); //TODO: sort by rating
 		for (p, _) in peers {
 			self.sync_peer(io, p);
@@ -644,25 +648,25 @@ impl ChainSync {
 		let td = io.chain().chain_info().pending_total_difficulty;
 		let syncing_difficulty = max(self.syncing_difficulty, td);
 
-		match self.state {
-			SyncState::Idle => {
-				self.state = SyncState::ChainHead;
-				self.sync_peer(io, peer_id);
-			},
-			SyncState::ChainHead => {
-				// Request subchain headers
-				if peer_difficulty > syncing_difficulty {
+		if peer_difficulty.map_or(true, |pd| pd > syncing_difficulty) {
+			match self.state {
+				SyncState::Idle => {
+					self.state = SyncState::ChainHead;
+					self.sync_peer(io, peer_id);
+				},
+				SyncState::ChainHead => {
+					// Request subchain headers
 					trace!(target: "sync", "Starting sync with better chain");
 					let last = self.last_imported_hash.clone();
-					self.request_headers_by_hash(io, peer_id, &last, 128, 256, false);
+					self.request_headers_by_hash(io, peer_id, &last, 128, 255, false);
+				},
+				SyncState::Blocks | SyncState::NewBlocks => {
+					if io.chain().block_status(BlockId::Hash(peer_latest)) == BlockStatus::Unknown {
+						self.request_blocks(io, peer_id, false);
+					}
 				}
-			},
-			SyncState::Blocks | SyncState::NewBlocks => {
-				if io.chain().block_status(BlockId::Hash(peer_latest)) == BlockStatus::Unknown {
-					self.request_blocks(io, peer_id, false);
-				}
+				SyncState::Waiting => ()
 			}
-			SyncState::Waiting => ()
 		}
 	}
 
@@ -700,9 +704,6 @@ impl ChainSync {
 
 	/// Checks if there are blocks fully downloaded that can be imported into the blockchain and does the import.
 	fn collect_blocks(&mut self, io: &mut SyncIo) {
-		if self.blocks.is_empty() {
-			return;
-		}
 		let mut restart = false;
 		let mut imported = HashSet::new();
 		let blocks = self.blocks.drain();
@@ -866,7 +867,7 @@ impl ChainSync {
 			trace!(target: "sync", "-> GetBlockHeaders (hash: {}, max: {}, skip: {}, reverse:{})", hash, max_headers, skip, reverse);
 			match io.chain().block_header(BlockId::Hash(hash)) {
 				Some(hdr) => From::from(HeaderView::new(&hdr).number()),
-				None => last
+				None => return Ok(Some((BLOCK_HEADERS_PACKET, RlpStream::new_list(0)))) //no such header, return nothing
 			}
 		} else {
 			trace!(target: "sync", "-> GetBlockHeaders (number: {}, max: {}, skip: {}, reverse:{})", try!(r.val_at::<BlockNumber>(0)), max_headers, skip, reverse);
@@ -1318,6 +1319,70 @@ mod tests {
 	}
 
 	#[test]
+	fn return_block_headers() {
+		use ethcore::views::HeaderView;
+		fn make_hash_req(h: &H256, count: usize, skip: usize, reverse: bool) -> Bytes {
+			let mut rlp = RlpStream::new_list(4);
+			rlp.append(h);
+			rlp.append(&count);
+			rlp.append(&skip);
+			rlp.append(&if reverse {1u32} else {0u32});
+			rlp.out()
+		}
+
+		fn make_num_req(n: usize, count: usize, skip: usize, reverse: bool) -> Bytes {
+			let mut rlp = RlpStream::new_list(4);
+			rlp.append(&n);
+			rlp.append(&count);
+			rlp.append(&skip);
+			rlp.append(&if reverse {1u32} else {0u32});
+			rlp.out()
+		}
+		fn to_header_vec(rlp: ::chain::RlpResponseResult) -> Vec<Bytes> {
+			Rlp::new(&rlp.unwrap().unwrap().1.out()).iter().map(|r| r.as_raw().to_vec()).collect()
+		}
+
+		let mut client = TestBlockChainClient::new();
+		client.add_blocks(100, EachBlockWith::Nothing);
+		let blocks: Vec<_> = (0 .. 100).map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap()).collect();
+		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+
+		let mut queue = VecDeque::new();
+		let io = TestIo::new(&mut client, &mut queue, None);
+
+		let unknown: H256 = H256::new();
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&unknown, 1, 0, false)));
+		assert!(to_header_vec(result).is_empty());
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&unknown, 1, 0, true)));
+		assert!(to_header_vec(result).is_empty());
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&hashes[2], 1, 0, true)));
+		assert_eq!(to_header_vec(result), vec![headers[2].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&hashes[2], 1, 0, false)));
+		assert_eq!(to_header_vec(result), vec![headers[2].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&hashes[50], 3, 5, false)));
+		assert_eq!(to_header_vec(result), vec![headers[50].clone(), headers[56].clone(), headers[62].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&hashes[50], 3, 5, true)));
+		assert_eq!(to_header_vec(result), vec![headers[50].clone(), headers[44].clone(), headers[38].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_num_req(2, 1, 0, true)));
+		assert_eq!(to_header_vec(result), vec![headers[2].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_num_req(2, 1, 0, false)));
+		assert_eq!(to_header_vec(result), vec![headers[2].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_num_req(50, 3, 5, false)));
+		assert_eq!(to_header_vec(result), vec![headers[50].clone(), headers[56].clone(), headers[62].clone()]);
+
+		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_num_req(50, 3, 5, true)));
+		assert_eq!(to_header_vec(result), vec![headers[50].clone(), headers[44].clone(), headers[38].clone()]);
+	}
+
+	#[test]
 	fn return_nodes() {
 		let mut client = TestBlockChainClient::new();
 		let mut queue = VecDeque::new();
@@ -1354,7 +1419,7 @@ mod tests {
 				network_id: U256::zero(),
 				latest_hash: peer_latest_hash,
 				latest_number: None,
-				difficulty: U256::zero(),
+				difficulty: None,
 				asking: PeerAsking::Nothing,
 				asking_blocks: Vec::new(),
 				asking_hash: None,
@@ -1624,54 +1689,5 @@ mod tests {
 		let status = sync.miner.status();
 		assert_eq!(status.transactions_in_pending_queue, 0);
 		assert_eq!(status.transactions_in_future_queue, 0);
-	}
-
-	#[test]
-	fn returns_requested_block_headers() {
-		let mut client = TestBlockChainClient::new();
-		client.add_blocks(100, EachBlockWith::Uncle);
-		let mut queue = VecDeque::new();
-		let io = TestIo::new(&mut client, &mut queue, None);
-
-		let mut rlp = RlpStream::new_list(4);
-		rlp.append(&0u64);
-		rlp.append(&10u64);
-		rlp.append(&0u64);
-		rlp.append(&0u64);
-		let data = rlp.out();
-
-		let response = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&data));
-
-		assert!(response.is_ok());
-		let (_, rlp_stream) = response.unwrap().unwrap();
-		let response_data = rlp_stream.out();
-		let rlp = UntrustedRlp::new(&response_data);
-		assert!(rlp.at(0).is_ok());
-		assert!(rlp.at(9).is_ok());
-	}
-
-	#[test]
-	fn returns_requested_block_headers_reverse() {
-		let mut client = TestBlockChainClient::new();
-		client.add_blocks(100, EachBlockWith::Uncle);
-		let mut queue = VecDeque::new();
-		let io = TestIo::new(&mut client, &mut queue, None);
-
-		let mut rlp = RlpStream::new_list(4);
-		rlp.append(&15u64);
-		rlp.append(&15u64);
-		rlp.append(&0u64);
-		rlp.append(&1u64);
-		let data = rlp.out();
-
-		let response = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&data));
-
-		assert!(response.is_ok());
-		let (_, rlp_stream) = response.unwrap().unwrap();
-		let response_data = rlp_stream.out();
-		let rlp = UntrustedRlp::new(&response_data);
-		assert!(rlp.at(0).is_ok());
-		assert!(rlp.at(14).is_ok());
-		assert!(!rlp.at(15).is_ok());
 	}
 }

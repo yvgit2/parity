@@ -22,7 +22,6 @@ known_heap_size!(0, HeaderId, SyncBlock);
 struct SyncBlock {
 	header: Bytes,
 	body: Option<Bytes>,
-	next: Option<H256>,
 }
 
 /// Used to identify header by transactions and uncles hashes
@@ -79,11 +78,15 @@ impl BlockCollection {
 		if self.blocks.contains_key(&hash) {
 			return Ok(hash);
 		}
-		self.downloading_headers.remove(&hash);
+		match self.head {
+			None if hash == self.heads[0] => {
+				self.head = Some(info.parent_hash);
+			},
+			_ => ()
+		}
 
 		let mut block = SyncBlock {
 			header: header,
-			next: None,
 			body: None,
 		};
 		let header_id = HeaderId {
@@ -101,12 +104,6 @@ impl BlockCollection {
 			self.header_ids.insert(header_id, hash.clone());
 		}
 
-		if let Some(p) = self.parents.get(&hash) {
-			block.next = Some(p.clone());
-		}
-		if let Some(ref mut parent) = self.blocks.get_mut(&info.parent_hash) {
-			parent.next = Some(hash.clone());
-		}
 		self.parents.insert(info.parent_hash.clone(), hash.clone());
 		self.blocks.insert(hash.clone(), block);
 		Ok(hash)
@@ -114,7 +111,6 @@ impl BlockCollection {
 
 	pub fn reset_to(&mut self, hashes: Vec<H256>) {
 		self.clear();
-		self.head = hashes.first().cloned();
 		self.heads = hashes;
 	}
 
@@ -168,9 +164,9 @@ impl BlockCollection {
 		for s in self.heads.drain(..) {
 			let mut h = s.clone();
 			loop {
-				match self.blocks.get(&h) {
-					Some(block) if block.next.is_some() => {
-						h = block.next.unwrap();
+				match self.parents.get(&h) {
+					Some(next) => {
+						h = next.clone();
 						if old_subchains.contains(&h) {
 							trace!("Completed subchain {:?}", s);
 							break; // reached head of the other subchain, merge by not adding
@@ -193,15 +189,14 @@ impl BlockCollection {
 		let mut needed_bodies: Vec<H256> = Vec::new();
 		let mut head = self.head;
 		while head.is_some() && needed_bodies.len() < count {
-			match self.blocks.get(&head.unwrap()) {
-				Some(block) if block.body.is_none() && block.next.is_some() => {
-					needed_bodies.push(head.unwrap().clone());
-					head = block.next.clone();
+			head = self.parents.get(&head.unwrap()).cloned();
+			if let Some(head) = head {
+				match self.blocks.get(&head) {
+					Some(block) if block.body.is_none() => {
+						needed_bodies.push(head.clone());
+					}
+					_ => (),
 				}
-				Some(block) => {
-					head = block.next.clone();
-				}
-				_ => break,
 			}
 		}
 		self.downloading_bodies.extend(needed_bodies.iter());
@@ -236,25 +231,19 @@ impl BlockCollection {
 		let mut drained = Vec::new();
 		let mut hashes = Vec::new();
 		{
-			let mut head = self.head.unwrap().clone();
 			let mut blocks = Vec::new();
-			loop {
-				if &head == self.heads.first().unwrap() {
-					break;
-				}
-				match self.blocks.get(&head) {
-					Some(block) if block.body.is_some() => {
-						blocks.push(block);
-						hashes.push(head);
-						match block.next {
-							Some(h) => {
-								self.head = Some(h.clone());
-								head = h.clone();
-							},
-							None => break,
+			let mut head = self.head;
+			while head.is_some() {
+				head = self.parents.get(&head.unwrap()).cloned();
+				if let Some(head) = head {
+					match self.blocks.get(&head) {
+						Some(block) if block.body.is_some() => {
+							blocks.push(block);
+							hashes.push(head);
+							self.head = Some(head);
 						}
+						_ => break,
 					}
-					_ => break,
 				}
 			}
 
@@ -274,7 +263,8 @@ impl BlockCollection {
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.blocks.len() <= 1 && self.heads.len() <= 1
+		return self.heads.len() == 0 ||
+			(self.heads.len() == 1 && self.head.map_or(false, |h| h == self.heads[0]))
 	}
 
 	pub fn contains(&self, hash: &H256) -> bool {
@@ -338,7 +328,6 @@ mod test {
 		bc.reset_to(heads);
 		assert!(!bc.is_empty());
 		assert_eq!(hashes[0], bc.heads[0]);
-		assert_eq!(hashes[0], bc.head.unwrap());
 		assert!(bc.needed_bodies(1, false).is_empty());
 		assert!(!bc.contains(&hashes[0]));
 		assert!(!bc.is_downloading(&hashes[0]));
@@ -352,13 +341,13 @@ mod test {
 
 		bc.insert_headers(headers[0..6].to_vec());
 		assert_eq!(hashes[5], bc.heads[0]);
-		assert_eq!(hashes[0], bc.head.unwrap());
 		assert_eq!(bc.downloading_headers.len(), 0);
 		assert!(!bc.is_downloading(&hashes[0]));
 		assert!(bc.contains(&hashes[0]));
 
-		assert_eq!(&bc.drain()[..], &blocks[0..5]);
+		assert_eq!(&bc.drain()[..], &blocks[0..6]);
 		assert!(!bc.contains(&hashes[0]));
+		assert_eq!(hashes[5], bc.head.unwrap());
 
 		let (h, _) = bc.needed_headers(6, false).unwrap();
 		assert_eq!(hashes[5], h);
@@ -367,7 +356,7 @@ mod test {
 		bc.insert_headers(headers[10..16].to_vec());
 		assert!(bc.drain().is_empty());
 		bc.insert_headers(headers[5..10].to_vec());
-		assert_eq!(&bc.drain()[..], &blocks[5..15]);
+		assert_eq!(&bc.drain()[..], &blocks[6..16]);
 		assert_eq!(hashes[15], bc.heads[0]);
 
 		bc.insert_headers(headers[16..].to_vec());
