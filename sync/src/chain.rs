@@ -234,8 +234,10 @@ pub struct ChainSync {
 	starting_block: BlockNumber,
 	/// Highest block number seen
 	highest_block: Option<BlockNumber>,
-	/// Peer info
+	/// All connected peers
 	peers: HashMap<PeerId, PeerInfo>,
+	/// Peers active for current sync round
+	active_peers: HashSet<PeerId>,
 	/// Downloaded blocks
 	blocks: BlockCollection,
 	/// Last impoted block number
@@ -260,20 +262,23 @@ impl ChainSync {
 	/// Create a new instance of syncing strategy.
 	pub fn new(config: SyncConfig, miner: Arc<Miner>, chain: &BlockChainClient) -> ChainSync {
 		let chain = chain.chain_info();
-		ChainSync {
+		let mut sync = ChainSync {
 			state: SyncState::ChainHead,
 			starting_block: 0,
 			highest_block: None,
 			last_imported_block: chain.best_block_number,
 			last_imported_hash: chain.best_block_hash,
 			peers: HashMap::new(),
+			active_peers: HashSet::new(),
 			blocks: BlockCollection::new(),
 			syncing_difficulty: U256::from(0u64),
 			last_sent_block_number: 0,
 			//max_download_ahead_blocks: max(MAX_HEADERS_TO_REQUEST, config.max_download_ahead_blocks),
 			network_id: config.network_id,
 			miner: miner,
-		}
+		};
+		sync.reset();
+		sync
 	}
 
 	/// @returns Synchonization status
@@ -305,7 +310,7 @@ impl ChainSync {
 	}
 
 	#[cfg_attr(feature="dev", allow(for_kv_map))] // Because it's not possible to get `values_mut()`
-	/// Rest sync. Clear all downloaded data but keep the queue
+	/// Reset sync. Clear all downloaded data but keep the queue
 	fn reset(&mut self) {
 		self.blocks.clear();
 		for (_, ref mut p) in &mut self.peers {
@@ -314,24 +319,37 @@ impl ChainSync {
 		}
 		self.syncing_difficulty = From::from(0u64);
 		self.state = SyncState::Idle;
+		self.blocks.clear();
+		self.active_peers = self.peers.keys().cloned().collect();
 	}
 
 	/// Restart sync
 	pub fn restart(&mut self, io: &mut SyncIo) {
 		self.reset();
-		self.starting_block = 0;
-		self.highest_block = None;
-		self.starting_block = io.chain().chain_info().best_block_number;
 		self.state = SyncState::ChainHead;
+		self.continue_sync(io);
+	}
+
+	/// Remove peer from active peer set
+	fn deactivate_peer(&mut self, io: &mut SyncIo, peer_id: PeerId) {
+		self.active_peers.remove(&peer_id);
+		if self.active_peers.is_empty() {
+			trace!(target: "sync", "No more active peers");
+			if self.state == SyncState::ChainHead {
+				self.complete_sync();
+			} else {
+				self.restart(io);
+			}
+		}
 	}
 
 	/// Restart sync after bad block has been detected. May end up re-downloading up to QUEUE_SIZE blocks
-	pub fn restart_on_bad_block(&mut self, io: &mut SyncIo) {
-		self.restart(io);
+	fn restart_on_bad_block(&mut self, io: &mut SyncIo) {
 		// Do not assume that the block queue/chain still has our last_imported_block
 		let chain = io.chain().chain_info();
 		self.last_imported_block = chain.best_block_number;
 		self.last_imported_hash = chain.best_block_hash;
+		self.restart(io);
 	}
 	/// Called by peer to report status
 	fn on_peer_status(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
@@ -367,6 +385,7 @@ impl ChainSync {
 		}
 
 		self.peers.insert(peer_id.clone(), peer);
+		self.active_peers.insert(peer_id.clone());
 		debug!(target: "sync", "Connected {}:{}", peer_id, io.peer_info(peer_id));
 		self.sync_peer(io, peer_id);
 		Ok(())
@@ -385,6 +404,10 @@ impl ChainSync {
 		}
 		if self.state == SyncState::Waiting {
 			trace!(target: "sync", "Ignored block headers while waiting");
+			return Ok(());
+		}
+		if item_count == 0 && self.state == SyncState::Blocks {
+			self.deactivate_peer(io, peer_id);
 			return Ok(());
 		}
 
@@ -465,20 +488,24 @@ impl ChainSync {
 		let item_count = r.item_count();
 		trace!(target: "sync", "{} -> BlockBodies ({} entries)", peer_id, item_count);
 		self.clear_peer_download(peer_id);
-		if self.state != SyncState::Blocks && self.state != SyncState::NewBlocks && self.state != SyncState::Waiting {
+		if item_count == 0 {
+			self.deactivate_peer(io, peer_id);
+		}
+		else if self.state != SyncState::Blocks && self.state != SyncState::NewBlocks && self.state != SyncState::Waiting {
 			trace!(target: "sync", "Ignored unexpected block bodies");
-			return Ok(());
 		}
-		if self.state == SyncState::Waiting {
+		else if self.state == SyncState::Waiting {
 			trace!(target: "sync", "Ignored block bodies while waiting");
-			return Ok(());
 		}
-		let mut bodies = Vec::with_capacity(item_count);
-		for i in 0..item_count {
-			bodies.push(try!(r.at(i)).as_raw().to_vec());
+		else
+		{
+			let mut bodies = Vec::with_capacity(item_count);
+			for i in 0..item_count {
+				bodies.push(try!(r.at(i)).as_raw().to_vec());
+			}
+			self.blocks.insert_bodies(bodies);
+			self.collect_blocks(io);
 		}
-		self.blocks.insert_bodies(bodies);
-		self.collect_blocks(io);
 		self.continue_sync(io);
 		Ok(())
 	}
@@ -526,7 +553,7 @@ impl ChainSync {
 				}
 			};
 		}
-  		else {
+		else {
 			unknown = true;
 		}
 		if unknown {
@@ -597,6 +624,7 @@ impl ChainSync {
 			debug!(target: "sync", "Disconnected {}", peer);
 			self.clear_peer_download(peer);
 			self.peers.remove(&peer);
+			self.active_peers.remove(&peer);
 			self.continue_sync(io);
 		}
 	}
@@ -615,7 +643,12 @@ impl ChainSync {
 		let mut peers: Vec<(PeerId, U256)> = self.peers.iter().map(|(k, p)| (*k, p.difficulty.unwrap_or_else(U256::zero))).collect();
 		peers.sort_by(|&(_, d1), &(_, d2)| d1.cmp(&d2).reverse()); //TODO: sort by rating
 		for (p, _) in peers {
-			self.sync_peer(io, p);
+			if self.active_peers.contains(&p) {
+				self.sync_peer(io, p);
+			}
+		}
+		if !self.peers.values().any(|p| p.asking != PeerAsking::Nothing) {
+			self.complete_sync();
 		}
 	}
 
@@ -645,12 +678,17 @@ impl ChainSync {
 			}
 			(peer.latest_hash.clone(), peer.difficulty.clone())
 		};
-		let td = io.chain().chain_info().pending_total_difficulty;
+		let chain_info = io.chain().chain_info();
+		let td = chain_info.pending_total_difficulty;
 		let syncing_difficulty = max(self.syncing_difficulty, td);
 
 		if peer_difficulty.map_or(true, |pd| pd > syncing_difficulty) {
 			match self.state {
 				SyncState::Idle => {
+					if self.last_imported_block < chain_info.best_block_number {
+						self.last_imported_block = chain_info.best_block_number;
+						self.last_imported_hash = chain_info.best_block_hash;
+					}
 					self.state = SyncState::ChainHead;
 					self.sync_peer(io, peer_id);
 				},
@@ -747,12 +785,12 @@ impl ChainSync {
 
 		if restart {
 			self.restart_on_bad_block(io);
-			self.continue_sync(io);
 			return;
 		}
 
 		if self.blocks.is_empty() {
-			self.complete_sync();
+			// complete sync round
+			self.restart(io);
 		}
 	}
 
@@ -838,7 +876,7 @@ impl ChainSync {
 			balance: chain.balance(a),
 		};
 		let _ = self.miner.import_transactions(transactions, fetch_account);
- 		Ok(())
+		Ok(())
 	}
 
 	/// Send Status message

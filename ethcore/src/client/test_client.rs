@@ -190,11 +190,23 @@ impl TestBlockChainClient {
 		}
 	}
 
-	/// TODO:
+	/// Make a bad block by setting invalid extra data.
 	pub fn corrupt_block(&mut self, n: BlockNumber) {
 		let hash = self.block_hash(BlockId::Number(n)).unwrap();
 		let mut header: BlockHeader = decode(&self.block_header(BlockId::Number(n)).unwrap());
-		header.parent_hash = H256::new();
+		header.extra_data = b"This extra data is way too long to be considered valid".to_vec();
+		let mut rlp = RlpStream::new_list(3);
+		rlp.append(&header);
+		rlp.append_raw(&rlp::NULL_RLP, 1);
+		rlp.append_raw(&rlp::NULL_RLP, 1);
+		self.blocks.write().unwrap().insert(hash, rlp.out());
+	}
+
+	/// Make a bad block by setting invalid parent hash.
+	pub fn corrupt_block_parent(&mut self, n: BlockNumber) {
+		let hash = self.block_hash(BlockId::Number(n)).unwrap();
+		let mut header: BlockHeader = decode(&self.block_header(BlockId::Number(n)).unwrap());
+		header.parent_hash = H256::from(42);
 		let mut rlp = RlpStream::new_list(3);
 		rlp.append(&header);
 		rlp.append_raw(&rlp::NULL_RLP, 1);

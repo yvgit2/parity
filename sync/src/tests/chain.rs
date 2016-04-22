@@ -32,6 +32,16 @@ fn two_peers() {
 }
 
 #[test]
+fn long_chain() {
+	::env_logger::init().ok();
+	let mut net = TestNet::new(2);
+	net.peer_mut(1).chain.add_blocks(50000, EachBlockWith::Nothing);
+	net.sync();
+	assert!(net.peer(0).chain.block(BlockId::Number(50000)).is_some());
+	assert_eq!(net.peer(0).chain.blocks.read().unwrap().deref(), net.peer(1).chain.blocks.read().unwrap().deref());
+}
+
+#[test]
 fn status_after_sync() {
 	::env_logger::init().ok();
 	let mut net = TestNet::new(3);
@@ -48,7 +58,7 @@ fn takes_few_steps() {
 	net.peer_mut(1).chain.add_blocks(100, EachBlockWith::Uncle);
 	net.peer_mut(2).chain.add_blocks(100, EachBlockWith::Uncle);
 	let total_steps = net.sync();
-	assert!(total_steps < 7);
+	assert!(total_steps < 20);
 }
 
 #[test]
@@ -80,6 +90,7 @@ fn forked() {
 	// peer 1 has the best chain of 601 blocks
 	let peer1_chain = net.peer(1).chain.numbers.read().unwrap().clone();
 	net.sync();
+	assert_eq!(net.peer(0).chain.difficulty.read().unwrap().deref(), net.peer(1).chain.difficulty.read().unwrap().deref());
 	assert_eq!(net.peer(0).chain.numbers.read().unwrap().deref(), &peer1_chain);
 	assert_eq!(net.peer(1).chain.numbers.read().unwrap().deref(), &peer1_chain);
 	assert_eq!(net.peer(2).chain.numbers.read().unwrap().deref(), &peer1_chain);
@@ -98,13 +109,13 @@ fn restart() {
 	net.restart_peer(0);
 
 	let status = net.peer(0).sync.status();
-	assert_eq!(status.state, SyncState::Idle);
+	assert_eq!(status.state, SyncState::ChainHead);
 }
 
 #[test]
 fn status_empty() {
 	let net = TestNet::new(2);
-	assert_eq!(net.peer(0).sync.status().state, SyncState::ChainHead);
+	assert_eq!(net.peer(0).sync.status().state, SyncState::Idle);
 }
 
 #[test]
@@ -167,8 +178,17 @@ fn restart_on_malformed_block() {
 	let mut net = TestNet::new(2);
 	net.peer_mut(1).chain.add_blocks(10, EachBlockWith::Uncle);
 	net.peer_mut(1).chain.corrupt_block(6);
-	net.sync_steps(10);
+	net.sync_steps(20);
 
-	assert_eq!(net.peer(0).chain.chain_info().best_block_number, 4);
+	assert_eq!(net.peer(0).chain.chain_info().best_block_number, 5);
 }
 
+#[test]
+fn restart_on_broken_chain() {
+	let mut net = TestNet::new(2);
+	net.peer_mut(1).chain.add_blocks(10, EachBlockWith::Uncle);
+	net.peer_mut(1).chain.corrupt_block_parent(6);
+	net.sync_steps(20);
+
+	assert_eq!(net.peer(0).chain.chain_info().best_block_number, 5);
+}

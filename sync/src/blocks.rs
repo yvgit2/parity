@@ -341,6 +341,9 @@ mod test {
 
 		bc.insert_headers(headers[0..6].to_vec());
 		assert_eq!(hashes[5], bc.heads[0]);
+		for h in &hashes[0..6] {
+			bc.clear_download(h)
+		}
 		assert_eq!(bc.downloading_headers.len(), 0);
 		assert!(!bc.is_downloading(&hashes[0]));
 		assert!(bc.contains(&hashes[0]));
