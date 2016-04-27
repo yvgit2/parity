@@ -394,10 +394,10 @@ impl ChainSync {
 	#[cfg_attr(feature="dev", allow(cyclomatic_complexity))]
 	/// Called by peer once it has new block headers during sync
 	fn on_peer_block_headers(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
+		self.clear_peer_download(peer_id);
 		self.reset_peer_asking(peer_id, PeerAsking::BlockHeaders);
 		let item_count = r.item_count();
 		trace!(target: "sync", "{} -> BlockHeaders ({} entries)", peer_id, item_count);
-		self.clear_peer_download(peer_id);
 		if self.state == SyncState::Idle {
 			trace!(target: "sync", "Ignored unexpected block headers");
 			return Ok(());
@@ -484,10 +484,10 @@ impl ChainSync {
 
 	/// Called by peer once it has new block bodies
 	fn on_peer_block_bodies(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
+		self.clear_peer_download(peer_id);
 		self.reset_peer_asking(peer_id, PeerAsking::BlockBodies);
 		let item_count = r.item_count();
 		trace!(target: "sync", "{} -> BlockBodies ({} entries)", peer_id, item_count);
-		self.clear_peer_download(peer_id);
 		if item_count == 0 {
 			self.deactivate_peer(io, peer_id);
 		}
@@ -734,8 +734,18 @@ impl ChainSync {
 	/// Clear all blocks/headers marked as being downloaded by a peer.
 	fn clear_peer_download(&mut self, peer_id: PeerId) {
 		let peer = self.peers.get_mut(&peer_id).unwrap();
-		for b in &peer.asking_blocks {
-			self.blocks.clear_download(&b);
+		match peer.asking {
+			PeerAsking::BlockHeaders => {
+				for b in &peer.asking_blocks {
+					self.blocks.clear_header_download(&b);
+				}
+			},
+			PeerAsking::BlockBodies => {
+				for b in &peer.asking_blocks {
+					self.blocks.clear_body_download(&b);
+				}
+			},
+			_ => (),
 		}
 		peer.asking_blocks.clear();
 	}

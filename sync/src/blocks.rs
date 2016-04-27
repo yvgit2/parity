@@ -192,7 +192,7 @@ impl BlockCollection {
 			head = self.parents.get(&head.unwrap()).cloned();
 			if let Some(head) = head {
 				match self.blocks.get(&head) {
-					Some(block) if block.body.is_none() => {
+					Some(block) if block.body.is_none() && !self.downloading_bodies.contains(&head) => {
 						needed_bodies.push(head.clone());
 					}
 					_ => (),
@@ -218,8 +218,11 @@ impl BlockCollection {
 		download.map(|h| (h, count))
 	}
 
-	pub fn clear_download(&mut self, hash: &H256) {
+	pub fn clear_header_download(&mut self, hash: &H256) {
 		self.downloading_headers.remove(hash);
+	}
+
+	pub fn clear_body_download(&mut self, hash: &H256) {
 		self.downloading_bodies.remove(hash);
 	}
 
@@ -342,7 +345,7 @@ mod test {
 		bc.insert_headers(headers[0..6].to_vec());
 		assert_eq!(hashes[5], bc.heads[0]);
 		for h in &hashes[0..6] {
-			bc.clear_download(h)
+			bc.clear_header_download(h)
 		}
 		assert_eq!(bc.downloading_headers.len(), 0);
 		assert!(!bc.is_downloading(&hashes[0]));
