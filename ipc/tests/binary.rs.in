@@ -14,12 +14,25 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Test rpc services.
 
-mod account_provider;
-mod sync_provider;
-mod miner_service;
+use ipc::*;
+use std::mem;
+use std::collections::VecDeque;
 
-pub use self::account_provider::{TestAccount, TestAccountProvider};
-pub use self::sync_provider::{Config, TestSyncProvider};
-pub use self::miner_service::{TestMinerService};
+#[derive(Binary)]
+pub enum Root {
+	Top,
+	Middle(u32, u64),
+}
+
+#[derive(Binary, PartialEq, Debug)]
+pub struct DoubleRoot {
+	pub x1: u32,
+	pub x2: u64,
+	pub x3: u32,
+}
+
+#[derive(Binary, PartialEq, Debug)]
+pub struct ReferenceStruct<'a> {
+	pub ref_data: &'a u64,
+}
