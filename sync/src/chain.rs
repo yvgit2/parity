@@ -198,6 +198,7 @@ enum PeerAsking {
 	Nothing,
 	BlockHeaders,
 	BlockBodies,
+	Heads,
 }
 
 #[derive(Clone)]
@@ -325,6 +326,7 @@ impl ChainSync {
 
 	/// Restart sync
 	pub fn restart(&mut self, io: &mut SyncIo) {
+		trace!(target: "sync", "Restarting");
 		self.reset();
 		self.state = SyncState::ChainHead;
 		self.continue_sync(io);
@@ -395,19 +397,26 @@ impl ChainSync {
 	/// Called by peer once it has new block headers during sync
 	fn on_peer_block_headers(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		self.clear_peer_download(peer_id);
-		self.reset_peer_asking(peer_id, PeerAsking::BlockHeaders);
+		let expected_asking = if self.state == SyncState::ChainHead { PeerAsking::Heads } else { PeerAsking::BlockHeaders };
+		if !self.reset_peer_asking(peer_id, expected_asking) {
+			trace!(target: "sync", "Ignored unexpected headers");
+			self.continue_sync(io);
+			return Ok(());
+		}
 		let item_count = r.item_count();
 		trace!(target: "sync", "{} -> BlockHeaders ({} entries)", peer_id, item_count);
 		if self.state == SyncState::Idle {
 			trace!(target: "sync", "Ignored unexpected block headers");
+			self.continue_sync(io);
 			return Ok(());
 		}
 		if self.state == SyncState::Waiting {
 			trace!(target: "sync", "Ignored block headers while waiting");
+			self.continue_sync(io);
 			return Ok(());
 		}
 		if item_count == 0 && self.state == SyncState::Blocks {
-			self.deactivate_peer(io, peer_id);
+			self.deactivate_peer(io, peer_id); //TODO: is this too harsh?
 			return Ok(());
 		}
 
@@ -429,7 +438,7 @@ impl ChainSync {
 				BlockStatus::InChain | BlockStatus::Queued => {
 					match self.state {
 						SyncState::Blocks | SyncState::NewBlocks => warn!(target: "sync", "Header already in chain {} ({})", number, hash),
-						_ => warn!(target: "sync", "Unexpected header already in chain {} ({}), state = {:?}", number, hash, self.state),
+						_ => trace!(target: "sync", "Unexpected header already in chain {} ({}), state = {:?}", number, hash, self.state),
 					}
 					headers.push(try!(r.at(i)).as_raw().to_vec());
 					hashes.push(hash);
@@ -465,6 +474,7 @@ impl ChainSync {
 						}
 					}
 				} else {
+					// TODO: validate heads better. E.g. check that there is enough distance between blocks.
 					trace!(target: "sync", "Received {} subchain heads, proceeding to download", headers.len());
 					self.blocks.reset_to(hashes);
 					self.state = SyncState::Blocks;
@@ -480,7 +490,6 @@ impl ChainSync {
 		self.continue_sync(io);
 		Ok(())
 	}
-
 
 	/// Called by peer once it has new block bodies
 	fn on_peer_block_bodies(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
@@ -521,6 +530,7 @@ impl ChainSync {
 			trace!(target: "sync", "NewBlock ignored while seeking");
 			return Ok(());
 		}
+		warn!(target: "sync", "{} -> NewBlock ({})", peer_id, h);
 		let header: BlockHeader = try!(header_rlp.as_val());
 		let mut unknown = false;
 		{
@@ -579,6 +589,7 @@ impl ChainSync {
 			return Ok(());
 		}
 		trace!(target: "sync", "{} -> NewHashes ({} entries)", peer_id, r.item_count());
+		warn!(target: "sync", "{} -> NewHashes ({} entries)", peer_id, r.item_count());
 		let hashes = r.iter().map(|item| (item.val_at::<H256>(0), item.val_at::<BlockNumber>(1)));
 		let mut max_height: BlockNumber = 0;
 		for (rh, rd) in hashes {
@@ -689,6 +700,7 @@ impl ChainSync {
 						self.last_imported_block = chain_info.best_block_number;
 						self.last_imported_hash = chain_info.best_block_hash;
 					}
+					trace!(target: "sync", "Starting sync with {}", peer_id);
 					self.state = SyncState::ChainHead;
 					self.sync_peer(io, peer_id);
 				},
@@ -696,7 +708,7 @@ impl ChainSync {
 					// Request subchain headers
 					trace!(target: "sync", "Starting sync with better chain");
 					let last = self.last_imported_hash.clone();
-					self.request_headers_by_hash(io, peer_id, &last, 128, 255, false);
+					self.request_headers_by_hash(io, peer_id, &last, 128, 255, false, PeerAsking::Heads);
 				},
 				SyncState::Blocks | SyncState::NewBlocks => {
 					if io.chain().block_status(BlockId::Hash(peer_latest)) == BlockStatus::Unknown {
@@ -727,7 +739,7 @@ impl ChainSync {
 		// find subchain to download
 		if let Some((h, count)) = self.blocks.needed_headers(MAX_HEADERS_TO_REQUEST, ignore_others) {
 			replace(&mut self.peers.get_mut(&peer_id).unwrap().asking_blocks, vec![h.clone()]);
-			self.request_headers_by_hash(io, peer_id, &h, count, 0, false);
+			self.request_headers_by_hash(io, peer_id, &h, count, 0, false, PeerAsking::BlockHeaders);
 		}
 	}
 
@@ -735,7 +747,7 @@ impl ChainSync {
 	fn clear_peer_download(&mut self, peer_id: PeerId) {
 		let peer = self.peers.get_mut(&peer_id).unwrap();
 		match peer.asking {
-			PeerAsking::BlockHeaders => {
+			PeerAsking::BlockHeaders | PeerAsking::Heads => {
 				for b in &peer.asking_blocks {
 					self.blocks.clear_header_download(&b);
 				}
@@ -800,25 +812,26 @@ impl ChainSync {
 
 		if self.blocks.is_empty() {
 			// complete sync round
+			trace!(target: "sync", "Sync round complete");
 			self.restart(io);
 		}
 	}
 
 	/// Request headers from a peer by block hash
-	fn request_headers_by_hash(&mut self, sync: &mut SyncIo, peer_id: PeerId, h: &H256, count: usize, skip: usize, reverse: bool) {
+	fn request_headers_by_hash(&mut self, sync: &mut SyncIo, peer_id: PeerId, h: &H256, count: usize, skip: usize, reverse: bool, asking: PeerAsking) {
 		trace!(target: "sync", "{} <- GetBlockHeaders: {} entries starting from {}", peer_id, count, h);
 		let mut rlp = RlpStream::new_list(4);
 		rlp.append(h);
 		rlp.append(&count);
 		rlp.append(&skip);
 		rlp.append(&if reverse {1u32} else {0u32});
-		self.send_request(sync, peer_id, PeerAsking::BlockHeaders, GET_BLOCK_HEADERS_PACKET, rlp.out());
+		self.send_request(sync, peer_id, asking, GET_BLOCK_HEADERS_PACKET, rlp.out());
 	}
 
 	/// Request block bodies from a peer
 	fn request_bodies(&mut self, sync: &mut SyncIo, peer_id: PeerId, hashes: Vec<H256>) {
 		let mut rlp = RlpStream::new_list(hashes.len());
-		trace!(target: "sync", "{} <- GetBlockBodies: {} entries", peer_id, hashes.len());
+		trace!(target: "sync", "{} <- GetBlockBodies: {} entries starting from {:?}", peer_id, hashes.len(), hashes.first());
 		for h in hashes {
 			rlp.append(&h);
 		}
@@ -826,13 +839,16 @@ impl ChainSync {
 	}
 
 	/// Reset peer status after request is complete.
-	fn reset_peer_asking(&mut self, peer_id: PeerId, asking: PeerAsking) {
+	fn reset_peer_asking(&mut self, peer_id: PeerId, asking: PeerAsking) -> bool {
 		let peer = self.peers.get_mut(&peer_id).unwrap();
 		if peer.asking != asking {
 			warn!(target:"sync", "Asking {:?} while expected {:?}", peer.asking, asking);
+			peer.asking = PeerAsking::Nothing;
+			false
 		}
 		else {
 			peer.asking = PeerAsking::Nothing;
+			true
 		}
 	}
 

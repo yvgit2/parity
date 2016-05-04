@@ -80,6 +80,7 @@ impl BlockCollection {
 		}
 		match self.head {
 			None if hash == self.heads[0] => {
+				trace!("New head {}", hash);
 				self.head = Some(info.parent_hash);
 			},
 			_ => ()
@@ -262,6 +263,7 @@ impl BlockCollection {
 		for h in hashes {
 			self.blocks.remove(&h);
 		}
+		trace!("Drained {} blocks, new head:{:?}", drained.len(), self.head);
 		drained
 	}
 
@@ -287,7 +289,6 @@ impl BlockCollection {
 
 #[cfg(test)]
 mod test {
-
 	use super::BlockCollection;
 	use ethcore::client::{TestBlockChainClient, EachBlockWith, BlockId, BlockChainClient};
 	use ethcore::views::HeaderView;
@@ -368,6 +369,28 @@ mod test {
 		bc.insert_headers(headers[16..].to_vec());
 		bc.drain();
 		assert!(bc.is_empty());
+	}
+
+	#[test]
+	fn insert_headers_with_gap() {
+		let mut bc = BlockCollection::new();
+		assert!(is_empty(&bc));
+		let client = TestBlockChainClient::new();
+		let nblocks = 200;
+		client.add_blocks(nblocks, EachBlockWith::Nothing);
+		let blocks: Vec<_> = (0 .. nblocks).map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap()).collect();
+		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let heads: Vec<_> = hashes.iter().enumerate().filter_map(|(i, h)| if i % 20 == 0 { Some(h.clone()) } else { None }).collect();
+		bc.reset_to(heads);
+
+		bc.insert_headers(headers[2..22].to_vec());
+		assert_eq!(hashes[0], bc.heads[0]);
+		assert_eq!(hashes[21], bc.heads[1]);
+		assert!(bc.head.is_none());
+		bc.insert_headers(headers[0..2].to_vec());
+		assert!(bc.head.is_some());
+		assert_eq!(hashes[21], bc.heads[0]);
 	}
 }
 
