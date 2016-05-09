@@ -20,13 +20,14 @@ use std::sync::{Arc, RwLock};
 use jsonrpc_core::IoHandler;
 use util::hash::{Address, H256, FixedHash};
 use util::numbers::{Uint, U256};
+use util::keys::{TestAccount, TestAccountProvider};
 use ethcore::client::{TestBlockChainClient, EachBlockWith, Executed, TransactionId};
 use ethcore::log_entry::{LocalizedLogEntry, LogEntry};
 use ethcore::receipt::LocalizedReceipt;
 use ethcore::transaction::{Transaction, Action};
 use ethminer::ExternalMiner;
 use v1::{Eth, EthClient};
-use v1::tests::helpers::{TestAccount, TestAccountProvider, TestSyncProvider, Config, TestMinerService};
+use v1::tests::helpers::{TestSyncProvider, Config, TestMinerService};
 
 fn blockchain_client() -> Arc<TestBlockChainClient> {
 	let client = TestBlockChainClient::new();
@@ -188,6 +189,22 @@ fn rpc_eth_balance() {
 		"id": 1
 	}"#;
 	let response = r#"{"jsonrpc":"2.0","result":"0x05","id":1}"#;
+
+	assert_eq!(tester.io.handle_request(request), Some(response.to_owned()));
+}
+
+#[ignore] //TODO: propert test
+#[test]
+fn rpc_eth_balance_pending() {
+	let tester = EthTester::default();
+
+	let request = r#"{
+		"jsonrpc": "2.0",
+		"method": "eth_getBalance",
+		"params": ["0x0000000000000000000000000000000000000001", "latest"],
+		"id": 1
+	}"#;
+	let response = r#"{"jsonrpc":"2.0","result":"0x","id":1}"#;
 
 	assert_eq!(tester.io.handle_request(request), Some(response.to_owned()));
 }

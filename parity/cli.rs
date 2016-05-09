@@ -59,7 +59,7 @@ Networking Options:
                            string or input to SHA3 operation.
 
 API and Console Options:
-  -j --jsonrpc             Enable the JSON-RPC API server.
+  --jsonrpc-off            Disable the JSON-RPC API server.
   --jsonrpc-port PORT      Specify the port portion of the JSONRPC API server
                            [default: 8545].
   --jsonrpc-interface IP   Specify the hostname portion of the JSONRPC API
@@ -68,10 +68,18 @@ API and Console Options:
   --jsonrpc-cors URL       Specify CORS header for JSON-RPC API responses.
   --jsonrpc-apis APIS      Specify the APIs available through the JSONRPC
                            interface. APIS is a comma-delimited list of API
-                           name. Possible name are web3, eth and net.
-                           [default: web3,eth,net,personal,ethcore].
-  -w --webapp              Enable the web applications server (e.g.
-                           status page).
+                           name. Possible name are web3, eth, net, personal,
+                           ethcore, traces.
+                           [default: web3,eth,net,personal,ethcore,traces].
+
+  --ipc-off                Disable JSON-RPC over IPC service.
+  --ipc-path PATH          Specify custom path for JSON-RPC over IPC service
+                           [default: $HOME/.parity/jsonrpc.ipc].
+  --ipc-apis APIS          Specify custom API set available via JSON-RPC over
+                           IPC [default: web3,eth,net,personal,ethcore].
+
+  --webapp-off             Disable the web applications server (e.g. status
+                           page).
   --webapp-port PORT       Specify the port portion of the WebApps server
                            [default: 8080].
   --webapp-interface IP    Specify the hostname portion of the WebApps
@@ -103,6 +111,11 @@ Sealing/Mining Options:
                            be included in next block) [default: 1024].
 
 Footprint Options:
+  --tracing BOOL           Indicates if full transaction tracing should be
+                           enabled. Works only if client had been fully synced with
+                           tracing enabled. BOOL may be one of auto, on, off.
+                           auto uses last used value of this option (off if it does
+                           not exist) [default: auto].
   --pruning METHOD         Configure pruning of the state/storage trie. METHOD
                            may be one of auto, archive, basic, fast, light:
                            archive - keep all state trie data. No pruning.
@@ -122,18 +135,26 @@ Footprint Options:
                            the entire system, overrides other cache and queue
                            options.
 
-Geth-compatibility Options:
+Legacy Options:
+  --geth                   Run in Geth-compatibility mode. Currently just sets
+                           the IPC path to be the same as Geth's. Overrides
+                           the --ipc-path/--ipcpath options.
   --datadir PATH           Equivalent to --db-path PATH.
   --testnet                Equivalent to --chain testnet.
   --networkid INDEX        Equivalent to --network-id INDEX.
   --maxpeers COUNT         Equivalent to --peers COUNT.
   --nodekey KEY            Equivalent to --node-key KEY.
   --nodiscover             Equivalent to --no-discovery.
-  --rpc                    Equivalent to --jsonrpc.
+  -j --jsonrpc             Does nothing; JSON-RPC is on by default now.
+  -w --webapp              Does nothing; web app server is on by default now.
+  --rpc                    Does nothing; JSON-RPC is on by default now.
   --rpcaddr IP             Equivalent to --jsonrpc-interface IP.
   --rpcport PORT           Equivalent to --jsonrpc-port PORT.
   --rpcapi APIS            Equivalent to --jsonrpc-apis APIS.
   --rpccorsdomain URL      Equivalent to --jsonrpc-cors URL.
+  --ipcdisable             Equivalent to --ipc-off.
+  --ipcapi APIS            Equivalent to --ipc-apis APIS.
+  --ipcpath PATH           Equivalent to --ipc-path PATH.
   --gasprice WEI           Minimum amount of Wei per GAS to be paid for a
                            transaction to be accepted for mining. Overrides
                            --basic-tx-usd.
@@ -164,6 +185,7 @@ pub struct Args {
 	pub flag_bootnodes: Option<String>,
 	pub flag_network_id: Option<String>,
 	pub flag_pruning: String,
+	pub flag_tracing: String,
 	pub flag_port: u16,
 	pub flag_peers: usize,
 	pub flag_no_discovery: bool,
@@ -172,12 +194,15 @@ pub struct Args {
 	pub flag_cache_pref_size: usize,
 	pub flag_cache_max_size: usize,
 	pub flag_queue_max_size: usize,
-	pub flag_jsonrpc: bool,
+	pub flag_jsonrpc_off: bool,
 	pub flag_jsonrpc_interface: String,
 	pub flag_jsonrpc_port: u16,
 	pub flag_jsonrpc_cors: Option<String>,
 	pub flag_jsonrpc_apis: String,
-	pub flag_webapp: bool,
+	pub flag_ipc_off: bool,
+	pub flag_ipc_path: String,
+	pub flag_ipc_apis: String,
+	pub flag_webapp_off: bool,
 	pub flag_webapp_port: u16,
 	pub flag_webapp_interface: String,
 	pub flag_webapp_user: Option<String>,
@@ -191,7 +216,8 @@ pub struct Args {
 	pub flag_tx_limit: usize,
 	pub flag_logging: Option<String>,
 	pub flag_version: bool,
-	// geth-compatibility...
+	// legacy...
+	pub flag_geth: bool,
 	pub flag_nodekey: Option<String>,
 	pub flag_nodiscover: bool,
 	pub flag_maxpeers: Option<usize>,
@@ -199,6 +225,8 @@ pub struct Args {
 	pub flag_extradata: Option<String>,
 	pub flag_etherbase: Option<String>,
 	pub flag_gasprice: Option<String>,
+	pub flag_jsonrpc: bool,
+	pub flag_webapp: bool,
 	pub flag_rpc: bool,
 	pub flag_rpcaddr: Option<String>,
 	pub flag_rpcport: Option<u16>,
@@ -206,6 +234,9 @@ pub struct Args {
 	pub flag_rpcapi: Option<String>,
 	pub flag_testnet: bool,
 	pub flag_networkid: Option<String>,
+	pub flag_ipcdisable: bool,
+	pub flag_ipcpath: Option<String>,
+	pub flag_ipcapi: Option<String>,
 }
 
 pub fn print_version() {

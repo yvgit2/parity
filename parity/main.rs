@@ -40,10 +40,9 @@ extern crate rpassword;
 extern crate semver;
 extern crate ethcore_ipc as ipc;
 extern crate ethcore_ipc_nano as nanoipc;
-extern crate serde;
-extern crate bincode;
 #[macro_use]
 extern crate hyper; // for price_info.rs
+extern crate json_ipc_server as jsonipc;
 
 #[cfg(feature = "rpc")]
 extern crate ethcore_rpc;
@@ -140,13 +139,13 @@ fn execute_client(conf: Configuration) {
 	// Build client
 	let mut service = ClientService::start(
 		client_config, spec, net_settings, &Path::new(&conf.path())
-	).unwrap_or_else(|e| die_with_error(e));
+	).unwrap_or_else(|e| die_with_error("Client", e));
 
 	panic_handler.forward_from(&service);
 	let client = service.client();
 
 	// Miner
-	let miner = Miner::new(conf.args.flag_force_sealing);
+	let miner = Miner::with_accounts(conf.args.flag_force_sealing, account_service.clone());
 	miner.set_author(conf.author());
 	miner.set_gas_floor_target(conf.gas_floor_target());
 	miner.set_extra_data(conf.extra_data());
@@ -159,14 +158,8 @@ fn execute_client(conf: Configuration) {
 	// Sync
 	let sync = EthSync::register(service.network(), sync_config, client.clone(), miner.clone());
 
-	// Setup rpc
-	let rpc_server = rpc::new(rpc::Configuration {
-		enabled: conf.args.flag_jsonrpc || conf.args.flag_rpc,
-		interface: conf.args.flag_rpcaddr.clone().unwrap_or(conf.args.flag_jsonrpc_interface.clone()),
-		port: conf.args.flag_rpcport.unwrap_or(conf.args.flag_jsonrpc_port),
-		apis: conf.args.flag_rpcapi.clone().unwrap_or(conf.args.flag_jsonrpc_apis.clone()),
-		cors: conf.args.flag_jsonrpc_cors.clone().or(conf.args.flag_rpccorsdomain.clone()),
-	}, rpc::Dependencies {
+	let dependencies = Arc::new(rpc::Dependencies {
+		panic_handler: panic_handler.clone(),
 		client: client.clone(),
 		sync: sync.clone(),
 		secret_store: account_service.clone(),
@@ -176,13 +169,27 @@ fn execute_client(conf: Configuration) {
 		settings: network_settings.clone(),
 	});
 
+	// Setup http rpc
+	let rpc_server = rpc::new_http(rpc::HttpConfiguration {
+		enabled: network_settings.rpc_enabled,
+		interface: network_settings.rpc_interface.clone(),
+		port: network_settings.rpc_port,
+		apis: conf.rpc_apis(),
+		cors: conf.rpc_cors(),
+	}, &dependencies);
+
+	// setup ipc rpc
+	let _ipc_server = rpc::new_ipc(conf.ipc_settings(), &dependencies);
+
+	if conf.args.flag_webapp { println!("WARNING: Flag -w/--webapp is deprecated. Web app server is now on by default. Ignoring."); }
 	let webapp_server = webapp::new(webapp::Configuration {
-		enabled: conf.args.flag_webapp,
+		enabled: !conf.args.flag_webapp_off,
 		interface: conf.args.flag_webapp_interface.clone(),
 		port: conf.args.flag_webapp_port,
 		user: conf.args.flag_webapp_user.clone(),
 		pass: conf.args.flag_webapp_pass.clone(),
 	}, webapp::Dependencies {
+		panic_handler: panic_handler.clone(),
 		client: client.clone(),
 		sync: sync.clone(),
 		secret_store: account_service.clone(),
@@ -205,6 +212,10 @@ fn execute_client(conf: Configuration) {
 	wait_for_exit(panic_handler, rpc_server, webapp_server);
 }
 
+fn flush_stdout() {
+	::std::io::stdout().flush().expect("stdout is flushable; qed");
+}
+
 fn execute_account_cli(conf: Configuration) {
 	use util::keys::store::SecretStore;
 	use rpassword::read_password;
@@ -212,8 +223,10 @@ fn execute_account_cli(conf: Configuration) {
 	if conf.args.cmd_new {
 		println!("Please note that password is NOT RECOVERABLE.");
 		print!("Type password: ");
+		flush_stdout();
 		let password = read_password().unwrap();
 		print!("Repeat password: ");
+		flush_stdout();
 		let password_repeat = read_password().unwrap();
 		if password != password_repeat {
 			println!("Passwords do not match!");

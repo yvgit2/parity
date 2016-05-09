@@ -22,9 +22,6 @@ use hash::Address;
 /// Ethash params deserialization.
 #[derive(Debug, PartialEq, Deserialize)]
 pub struct EthashParams {
-	/// Tie breaking gas.
-	#[serde(rename="tieBreakingGas")]
-	pub tie_breaking_gas: bool,
 	/// Gas limit divisor.
 	#[serde(rename="gasLimitBoundDivisor")]
 	pub gas_limit_bound_divisor: Uint,
@@ -42,6 +39,9 @@ pub struct EthashParams {
 	pub block_reward: Uint,
 	/// Namereg contract address.
 	pub registrar: Address,
+	/// Homestead transition block number.
+	#[serde(rename="frontierCompatibilityModeLimit")]
+	pub frontier_compatibility_mode_limit: Uint,
 }
 
 /// Ethash engine deserialization.
@@ -60,13 +60,13 @@ mod tests {
 	fn ethash_deserialization() {
 		let s = r#"{
 			"params": {
-				"tieBreakingGas": false,
 				"gasLimitBoundDivisor": "0x0400",
 				"minimumDifficulty": "0x020000",
 				"difficultyBoundDivisor": "0x0800",
 				"durationLimit": "0x0d",
 				"blockReward": "0x4563918244F40000",
-				"registrar" : "0xc6d9d2cd449a754c494264e1809c50e34d64562b"
+				"registrar" : "0xc6d9d2cd449a754c494264e1809c50e34d64562b",
+				"frontierCompatibilityModeLimit" : "0x42"
 			}
 		}"#;
 

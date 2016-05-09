@@ -161,7 +161,7 @@ pub enum SyncState {
 	Waiting,
 	/// Downloading blocks
 	Blocks,
-	/// Downloading blocks learned from NewHashes packet
+	/// Downloading blocks learned from `NewHashes` packet
 	NewBlocks,
 }
 
@@ -581,7 +581,7 @@ impl ChainSync {
 		Ok(())
 	}
 
-	/// Handles NewHashes packet. Initiates headers download for any unknown hashes.
+	/// Handles `NewHashes` packet. Initiates headers download for any unknown hashes.
 	fn on_peer_new_hashes(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		if self.state != SyncState::Idle {
 			trace!(target: "sync", "Ignoring new hashes since we're already downloading.");
@@ -1289,7 +1289,6 @@ impl ChainSync {
 			trace!(target: "sync", "Bad blocks in the queue, restarting");
 			self.restart_on_bad_block(io);
 		}
-		// TODO [todr] propagate transactions?
 	}
 
 	pub fn chain_new_head(&mut self, io: &mut SyncIo) {
@@ -1480,8 +1479,8 @@ mod tests {
 		assert_eq!(1, io.queue.len());
 	}
 
-	fn dummy_sync_with_peer(peer_latest_hash: H256, client: &BlockChainClient) -> ChainSync {
-		let mut sync = ChainSync::new(SyncConfig::default(), Miner::new(false), client);
+	fn dummy_sync_with_peer(peer_latest_hash: H256) -> ChainSync {
+		let mut sync = ChainSync::new(SyncConfig::default(), Arc::new(Miner::default()), client);
 		sync.peers.insert(0,
 			PeerInfo {
 				protocol_version: 0,
