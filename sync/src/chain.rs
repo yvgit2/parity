@@ -377,19 +377,19 @@ impl ChainSync {
 		let chain_info = io.chain().chain_info();
 		if peer.genesis != chain_info.genesis_hash {
 			io.disable_peer(peer_id);
-			trace!(target: "sync", "Peer {} genesis hash not matched (ours: {}, theirs: {})", peer_id, chain_info.genesis_hash, peer.genesis);
+			trace!(target: "sync", "Peer {} genesis hash mismatch (ours: {}, theirs: {})", peer_id, chain_info.genesis_hash, peer.genesis);
 			return Ok(());
 		}
 		if peer.network_id != self.network_id {
 			io.disable_peer(peer_id);
-			trace!(target: "sync", "Peer {} network id not matched (ours: {}, theirs: {})", peer_id, self.network_id, peer.network_id);
+			trace!(target: "sync", "Peer {} network id mismatch (ours: {}, theirs: {})", peer_id, self.network_id, peer.network_id);
 			return Ok(());
 		}
 
 		self.peers.insert(peer_id.clone(), peer);
 		self.active_peers.insert(peer_id.clone());
 		debug!(target: "sync", "Connected {}:{}", peer_id, io.peer_info(peer_id));
-		self.sync_peer(io, peer_id);
+		self.sync_peer(io, peer_id, false);
 		Ok(())
 	}
 
@@ -437,7 +437,7 @@ impl ChainSync {
 			match io.chain().block_status(BlockId::Hash(hash.clone())) {
 				BlockStatus::InChain | BlockStatus::Queued => {
 					match self.state {
-						SyncState::Blocks | SyncState::NewBlocks => warn!(target: "sync", "Header already in chain {} ({})", number, hash),
+						SyncState::Blocks | SyncState::NewBlocks => trace!(target: "sync", "Header already in chain {} ({})", number, hash),
 						_ => trace!(target: "sync", "Unexpected header already in chain {} ({}), state = {:?}", number, hash, self.state),
 					}
 					headers.push(try!(r.at(i)).as_raw().to_vec());
@@ -483,7 +483,7 @@ impl ChainSync {
 			SyncState::Blocks | SyncState::NewBlocks | SyncState::Waiting => {
 				self.blocks.insert_headers(headers);
 			},
-			_ => warn!(target: "sync", "Unexpected headers({}) from  {} ({}), state = {:?}", headers.len(), peer_id, io.peer_info(peer_id), self.state)
+			_ => trace!(target: "sync", "Unexpected headers({}) from  {} ({}), state = {:?}", headers.len(), peer_id, io.peer_info(peer_id), self.state)
 		}
 
 		self.collect_blocks(io);
@@ -530,7 +530,6 @@ impl ChainSync {
 			trace!(target: "sync", "NewBlock ignored while seeking");
 			return Ok(());
 		}
-		warn!(target: "sync", "{} -> NewBlock ({})", peer_id, h);
 		let header: BlockHeader = try!(header_rlp.as_val());
 		let mut unknown = false;
 		{
@@ -577,7 +576,7 @@ impl ChainSync {
 					trace!(target: "sync", "Received block {:?}  with no known parent. Peer needs syncing...", h);
 				}
 			}
-			self.sync_peer(io, peer_id);
+			self.sync_peer(io, peer_id, true);
 		}
 		Ok(())
 	}
@@ -589,9 +588,9 @@ impl ChainSync {
 			return Ok(());
 		}
 		trace!(target: "sync", "{} -> NewHashes ({} entries)", peer_id, r.item_count());
-		warn!(target: "sync", "{} -> NewHashes ({} entries)", peer_id, r.item_count());
 		let hashes = r.iter().map(|item| (item.val_at::<H256>(0), item.val_at::<BlockNumber>(1)));
 		let mut max_height: BlockNumber = 0;
+		let mut new_hashes = Vec::new();
 		for (rh, rd) in hashes {
 			let h = try!(rh);
 			let d = try!(rd);
@@ -606,6 +605,7 @@ impl ChainSync {
 					trace!(target: "sync", "New hash block already queued {:?}", h);
 				},
 				BlockStatus::Unknown => {
+					new_hashes.push(h.clone());
 					if d > max_height {
 						trace!(target: "sync", "New unknown block hash {:?}", h);
 						let peer = self.peers.get_mut(&peer_id).unwrap();
@@ -614,7 +614,7 @@ impl ChainSync {
 						max_height = d;
 					}
 				},
-				BlockStatus::Bad =>{
+				BlockStatus::Bad => {
 					debug!(target: "sync", "Bad new block hash {:?}", h);
 					io.disable_peer(peer_id);
 					return Ok(());
@@ -622,8 +622,10 @@ impl ChainSync {
 			}
 		};
 		if max_height != 0 {
-			self.state = SyncState::ChainHead;
-			self.sync_peer(io, peer_id);
+			trace!(target: "sync", "Downloading blocks for new hashes");
+			self.blocks.reset_to(new_hashes);
+			self.state = SyncState::Blocks;
+			self.sync_peer(io, peer_id, true);
 		}
 		Ok(())
 	}
@@ -655,7 +657,7 @@ impl ChainSync {
 		peers.sort_by(|&(_, d1), &(_, d2)| d1.cmp(&d2).reverse()); //TODO: sort by rating
 		for (p, _) in peers {
 			if self.active_peers.contains(&p) {
-				self.sync_peer(io, p);
+				self.sync_peer(io, p, false);
 			}
 		}
 		if !self.peers.values().any(|p| p.asking != PeerAsking::Nothing) {
@@ -677,7 +679,7 @@ impl ChainSync {
 	}
 
 	/// Find something to do for a peer. Called for a new peer or when a peer is done with it's task.
-	fn sync_peer(&mut self, io: &mut SyncIo,  peer_id: PeerId) {
+	fn sync_peer(&mut self, io: &mut SyncIo,  peer_id: PeerId, force: bool) {
 		let (peer_latest, peer_difficulty) = {
 			let peer = self.peers.get_mut(&peer_id).unwrap();
 			if peer.asking != PeerAsking::Nothing {
@@ -693,7 +695,7 @@ impl ChainSync {
 		let td = chain_info.pending_total_difficulty;
 		let syncing_difficulty = max(self.syncing_difficulty, td);
 
-		if peer_difficulty.map_or(true, |pd| pd > syncing_difficulty) {
+		if force || peer_difficulty.map_or(true, |pd| pd > syncing_difficulty) {
 			match self.state {
 				SyncState::Idle => {
 					if self.last_imported_block < chain_info.best_block_number {
@@ -702,7 +704,7 @@ impl ChainSync {
 					}
 					trace!(target: "sync", "Starting sync with {}", peer_id);
 					self.state = SyncState::ChainHead;
-					self.sync_peer(io, peer_id);
+					self.sync_peer(io, peer_id, force);
 				},
 				SyncState::ChainHead => {
 					// Request subchain headers
@@ -795,6 +797,10 @@ impl ChainSync {
 					self.last_imported_block = number;
 					self.last_imported_hash = h.clone();
 				},
+				Err(Error::Block(BlockError::UnknownParent(_))) if self.state == SyncState::NewBlocks => {
+					trace!(target: "sync", "Unknown new block parent, restarting sync");
+					break;
+				},
 				Err(e) => {
 					debug!(target: "sync", "Bad block {:?} : {:?}", h, e);
 					restart = true;
@@ -842,7 +848,7 @@ impl ChainSync {
 	fn reset_peer_asking(&mut self, peer_id: PeerId, asking: PeerAsking) -> bool {
 		let peer = self.peers.get_mut(&peer_id).unwrap();
 		if peer.asking != asking {
-			warn!(target:"sync", "Asking {:?} while expected {:?}", peer.asking, asking);
+			trace!(target:"sync", "Asking {:?} while expected {:?}", peer.asking, asking);
 			peer.asking = PeerAsking::Nothing;
 			false
 		}
