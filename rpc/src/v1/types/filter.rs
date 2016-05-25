@@ -20,9 +20,9 @@ use jsonrpc_core::Value;
 use util::numbers::*;
 use v1::types::BlockNumber;
 use ethcore::filter::Filter as EthFilter;
-use ethcore::client::BlockId;
+use ethcore::client::BlockID;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum VariadicValue<T> where T: Deserialize {
 	Single(T),
 	Multiple(Vec<T>),
@@ -47,7 +47,7 @@ impl<T> Deserialize for VariadicValue<T> where T: Deserialize {
 pub type FilterAddress = VariadicValue<Address>;
 pub type Topic = VariadicValue<H256>;
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Filter {
 	#[serde(rename="fromBlock")]
@@ -61,8 +61,8 @@ pub struct Filter {
 impl Into<EthFilter> for Filter {
 	fn into(self) -> EthFilter {
 		EthFilter {
-			from_block: self.from_block.map_or_else(|| BlockId::Latest, Into::into),
-			to_block: self.to_block.map_or_else(|| BlockId::Latest, Into::into),
+			from_block: self.from_block.map_or_else(|| BlockID::Latest, Into::into),
+			to_block: self.to_block.map_or_else(|| BlockID::Latest, Into::into),
 			address: self.address.and_then(|address| match address {
 				VariadicValue::Null => None,
 				VariadicValue::Single(a) => Some(vec![a]),

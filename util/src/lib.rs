@@ -29,6 +29,11 @@
 #![cfg_attr(feature="dev", allow(clone_on_copy))]
 // In most cases it expresses function flow better
 #![cfg_attr(feature="dev", allow(if_not_else))]
+// TODO [todr] a lot of warnings to be fixed
+#![cfg_attr(feature="dev", allow(needless_borrow))]
+#![cfg_attr(feature="dev", allow(assign_op_pattern))]
+#![cfg_attr(feature="dev", allow(unnecessary_operation))]
+
 
 //! Ethcore-util library
 //!
@@ -130,6 +135,7 @@ pub mod vector;
 pub mod sha3;
 pub mod hashdb;
 pub mod memorydb;
+pub mod migration;
 pub mod overlaydb;
 pub mod journaldb;
 pub mod kvdb;
@@ -148,6 +154,7 @@ pub mod panics;
 pub mod keys;
 pub mod table;
 pub mod network_settings;
+pub mod path;
 
 pub use common::*;
 pub use misc::*;

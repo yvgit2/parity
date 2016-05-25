@@ -19,48 +19,9 @@
 use util::*;
 use header::BlockNumber;
 use basic_types::LogBloom;
+use client::Error as ClientError;
 
-/// Result of executing the transaction.
-#[derive(PartialEq, Debug)]
-pub enum ExecutionError {
-	/// Returned when there gas paid for transaction execution is
-	/// lower than base gas required.
-	NotEnoughBaseGas {
-		/// Absolute minimum gas required.
-		required: U256,
-		/// Gas provided.
-		got: U256
-	},
-	/// Returned when block (gas_used + gas) > gas_limit.
-	///
-	/// If gas =< gas_limit, upstream may try to execute the transaction
-	/// in next block.
-	BlockGasLimitReached {
-		/// Gas limit of block for transaction.
-		gas_limit: U256,
-		/// Gas used in block prior to transaction.
-		gas_used: U256,
-		/// Amount of gas in block.
-		gas: U256
-	},
-	/// Returned when transaction nonce does not match state nonce.
-	InvalidNonce {
-		/// Nonce expected.
-		expected: U256,
-		/// Nonce found.
-		got: U256
-	},
-	/// Returned when cost of transaction (value + gas_price * gas) exceeds
-	/// current sender balance.
-	NotEnoughCash {
-		/// Minimum required balance.
-		required: U512,
-		/// Actual balance.
-		got: U512
-	},
-	/// Returned when internal evm error occurs.
-	Internal
-}
+pub use types::executed::ExecutionError;
 
 #[derive(Debug, PartialEq)]
 /// Errors concerning transaction processing.
@@ -97,6 +58,28 @@ pub enum TransactionError {
 	},
 	/// Transaction's gas limit (aka gas) is invalid.
 	InvalidGasLimit(OutOfBounds<U256>),
+}
+
+impl fmt::Display for TransactionError {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		use self::TransactionError::*;
+		let msg = match *self {
+			AlreadyImported => "Already imported".into(),
+			Old => "No longer valid".into(),
+			TooCheapToReplace => "Gas price too low to replace".into(),
+			LimitReached => "Transaction limit reached".into(),
+			InsufficientGasPrice { minimal, got } =>
+				format!("Insufficient gas price. Min={}, Given={}", minimal, got),
+			InsufficientBalance { balance, cost } =>
+				format!("Insufficient balance for transaction. Balance={}, Cost={}",
+					balance, cost),
+			GasLimitExceeded { limit, got } =>
+				format!("Gas limit exceeded. Limit={}, Given={}", limit, got),
+			InvalidGasLimit(ref err) => format!("Invalid gas limit. {}", err),
+		};
+
+		f.write_fmt(format_args!("Transaction error ({})", msg))
+	}
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,7 +120,7 @@ pub enum BlockError {
 	MismatchedH256SealElement(Mismatch<H256>),
 	/// Proof-of-work aspect of seal, which we assume is a 256-bit value, is invalid.
 	InvalidProofOfWork(OutOfBounds<U256>),
-	/// Some low-level aspect of the seal in incorrect.
+	/// Some low-level aspect of the seal is incorrect.
 	InvalidSeal,
 	/// Gas limit header field is invalid.
 	InvalidGasLimit(OutOfBounds<U256>),
@@ -160,6 +143,43 @@ pub enum BlockError {
 	UnknownUncleParent(H256),
 }
 
+impl fmt::Display for BlockError {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		use self::BlockError::*;
+
+		let msg = match *self {
+			TooManyUncles(ref oob) => format!("Block has too many uncles. {}", oob),
+			ExtraDataOutOfBounds(ref oob) => format!("Extra block data too long. {}", oob),
+			InvalidSealArity(ref mis) => format!("Block seal in incorrect format: {}", mis),
+			TooMuchGasUsed(ref oob) => format!("Block has too much gas used. {}", oob),
+			InvalidUnclesHash(ref mis) => format!("Block has invalid uncles hash: {}", mis),
+			UncleTooOld(ref oob) => format!("Uncle block is too old. {}", oob),
+			UncleIsBrother(ref oob) => format!("Uncle from same generation as block. {}", oob),
+			UncleInChain(ref hash) => format!("Uncle {} already in chain", hash),
+			UncleParentNotInChain(ref hash) => format!("Uncle {} has a parent not in the chain", hash),
+			InvalidStateRoot(ref mis) => format!("Invalid state root in header: {}", mis),
+			InvalidGasUsed(ref mis) => format!("Invalid gas used in header: {}", mis),
+			InvalidTransactionsRoot(ref mis) => format!("Invalid transactions root in header: {}", mis),
+			DifficultyOutOfBounds(ref oob) => format!("Invalid block difficulty: {}", oob),
+			InvalidDifficulty(ref mis) => format!("Invalid block difficulty: {}", mis),
+			MismatchedH256SealElement(ref mis) => format!("Seal element out of bounds: {}", mis),
+			InvalidProofOfWork(ref oob) => format!("Block has invalid PoW: {}", oob),
+			InvalidSeal => "Block has invalid seal.".into(),
+			InvalidGasLimit(ref oob) => format!("Invalid gas limit: {}", oob),
+			InvalidReceiptsRoot(ref mis) => format!("Invalid receipts trie root in header: {}", mis),
+			InvalidTimestamp(ref oob) => format!("Invalid timestamp in header: {}", oob),
+			InvalidLogBloom(ref oob) => format!("Invalid log bloom in header: {}", oob),
+			InvalidParentHash(ref mis) => format!("Invalid parent hash: {}", mis),
+			InvalidNumber(ref mis) => format!("Invalid number in header: {}", mis),
+			RidiculousNumber(ref oob) => format!("Implausible block number. {}", oob),
+			UnknownParent(ref hash) => format!("Unknown parent: {}", hash),
+			UnknownUncleParent(ref hash) => format!("Unknown uncle parent: {}", hash),
+		};
+
+		f.write_fmt(format_args!("Block error ({})", msg))
+	}
+}
+
 #[derive(Debug, PartialEq)]
 /// Import to the block queue result
 pub enum ImportError {
@@ -171,9 +191,23 @@ pub enum ImportError {
 	KnownBad,
 }
 
+impl fmt::Display for ImportError {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		let msg = match *self {
+			ImportError::AlreadyInChain => "block already in chain",
+			ImportError::AlreadyQueued => "block already in the block queue",
+			ImportError::KnownBad => "block known to be bad",
+		};
+
+		f.write_fmt(format_args!("Block import error ({})", msg))
+	}
+}
+
 #[derive(Debug)]
 /// General error type which should be capable of representing all errors in ethcore.
 pub enum Error {
+	/// Client configuration error.
+	Client(ClientError),
 	/// Error concerning a utility.
 	Util(UtilError),
 	/// Error concerning block processing.
@@ -192,8 +226,31 @@ pub enum Error {
 	PowInvalid,
 }
 
+impl fmt::Display for Error {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		match *self {
+			Error::Client(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::Util(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::Block(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::Execution(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::Transaction(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::Import(ref err) => f.write_fmt(format_args!("{}", err)),
+			Error::UnknownEngineName(ref name) =>
+				f.write_fmt(format_args!("Unknown engine name ({})", name)),
+			Error::PowHashInvalid => f.write_str("Invalid or out of date PoW hash."),
+			Error::PowInvalid => f.write_str("Invalid nonce or mishash"),
+		}
+	}
+}
+
 /// Result of import block operation.
 pub type ImportResult = Result<H256, Error>;
+
+impl From<ClientError> for Error {
+	fn from(err: ClientError) -> Error {
+		Error::Client(err)
+	}
+}
 
 impl From<TransactionError> for Error {
 	fn from(err: TransactionError) -> Error {

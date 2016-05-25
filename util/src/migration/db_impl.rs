@@ -14,16 +14,21 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use util::numbers::H256;
+//! kvdb::Database as migration::Destination
 
-/// Represents a tree route between `from` block and `to` block:
-#[derive(Debug)]
-pub struct TreeRoute {
-	/// A vector of hashes of all blocks, ordered from `from` to `to`.
-	pub blocks: Vec<H256>,
-	/// Best common ancestor of these blocks.
-	pub ancestor: H256,
-	/// An index where best common ancestor would be.
-	pub index: usize,
+use std::collections::BTreeMap;
+use kvdb::{Database, DBTransaction};
+use migration::{Destination, Error};
+
+impl Destination for Database {
+	fn commit(&mut self, batch: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), Error> {
+		let transaction = DBTransaction::new();
+
+		for keypair in &batch {
+			try!(transaction.put(&keypair.0, &keypair.1).map_err(Error::Custom))
+		}
+
+		self.write(transaction).map_err(Error::Custom)
+	}
 }
 

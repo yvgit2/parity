@@ -14,9 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+extern crate ansi_term;
+use self::ansi_term::Colour::{White, Yellow, Green, Cyan, Blue, Purple};
+use self::ansi_term::Style;
+
+use std::time::{Instant, Duration};
 use std::sync::RwLock;
 use std::ops::{Deref, DerefMut};
 use ethsync::{EthSync, SyncProvider};
+use util::Uint;
 use ethcore::client::*;
 use number_prefix::{binary_prefix, Standalone, Prefixed};
 
@@ -24,6 +30,8 @@ pub struct Informant {
 	chain_info: RwLock<Option<BlockChainInfo>>,
 	cache_info: RwLock<Option<BlockChainCacheSize>>,
 	report: RwLock<Option<ClientReport>>,
+	last_tick: RwLock<Instant>,
+	with_color: bool,
 }
 
 impl Default for Informant {
@@ -32,11 +40,34 @@ impl Default for Informant {
 			chain_info: RwLock::new(None),
 			cache_info: RwLock::new(None),
 			report: RwLock::new(None),
+			last_tick: RwLock::new(Instant::now()),
+			with_color: true,
 		}
 	}
 }
 
+trait MillisecondDuration {
+	fn as_milliseconds(&self) -> u64;
+}
+
+impl MillisecondDuration for Duration {
+	fn as_milliseconds(&self) -> u64 {
+		self.as_secs() * 1000 + self.subsec_nanos() as u64 / 1000000
+	}
+}
+
 impl Informant {
+	/// Make a new instance potentially `with_color` output.
+	pub fn new(with_color: bool) -> Self {
+		Informant {
+			chain_info: RwLock::new(None),
+			cache_info: RwLock::new(None),
+			report: RwLock::new(None),
+			last_tick: RwLock::new(Instant::now()),
+			with_color: with_color,
+		}
+	}
+
 	fn format_bytes(b: usize) -> String {
 		match binary_prefix(b as f64) {
 			Standalone(bytes)   => format!("{} bytes", bytes),
@@ -44,40 +75,64 @@ impl Informant {
 		}
 	}
 
-	pub fn tick(&self, client: &Client, sync: &EthSync) {
-		// 5 seconds betwen calls. TODO: calculate this properly.
-		let dur = 5usize;
+	pub fn tick(&self, client: &Client, maybe_sync: Option<&EthSync>) {
+		let elapsed = self.last_tick.read().unwrap().elapsed();
+		if elapsed < Duration::from_secs(5) {
+			return;
+		}
+
+		*self.last_tick.write().unwrap() = Instant::now();
 
 		let chain_info = client.chain_info();
 		let queue_info = client.queue_info();
 		let cache_info = client.blockchain_cache_info();
-		let sync_info = sync.status();
 
 		let mut write_report = self.report.write().unwrap();
 		let report = client.report();
+
+		let paint = |c: Style, t: String| match self.with_color {
+			true => format!("{}", c.paint(t)),
+			false => t,
+		};
 
 		if let (_, _, &Some(ref last_report)) = (
 			self.chain_info.read().unwrap().deref(),
 			self.cache_info.read().unwrap().deref(),
 			write_report.deref()
 		) {
-			println!("[ #{} {} ]---[ {} blk/s | {} tx/s | {} gas/s  //··· {}/{} peers, #{}, {}+{} queued ···// mem: {} db, {} chain, {} queue, {} sync ]",
-				chain_info.best_block_number,
-				chain_info.best_block_hash,
-				(report.blocks_imported - last_report.blocks_imported) / dur,
-				(report.transactions_applied - last_report.transactions_applied) / dur,
-				(report.gas_processed - last_report.gas_processed) / From::from(dur),
+			println!("{} {}   {} blk/s {} tx/s {} Mgas/s   {}{}+{} Qed   {} db {} chain {} queue{}",
+				paint(White.bold(), format!("{:>8}", format!("#{}", chain_info.best_block_number))),
+				paint(White.bold(), format!("{}", chain_info.best_block_hash)),
 
-				sync_info.num_active_peers,
-				sync_info.num_peers,
-				sync_info.last_imported_block_number.unwrap_or(chain_info.best_block_number),
-				queue_info.unverified_queue_size,
-				queue_info.verified_queue_size,
+				paint(Yellow.bold(), format!("{:4}", ((report.blocks_imported - last_report.blocks_imported) * 1000) as u64 / elapsed.as_milliseconds())),
+				paint(Yellow.bold(), format!("{:4}", ((report.transactions_applied - last_report.transactions_applied) * 1000) as u64 / elapsed.as_milliseconds())),
+				paint(Yellow.bold(), format!("{:3}", ((report.gas_processed - last_report.gas_processed) / From::from(elapsed.as_milliseconds() * 1000)).low_u64())),
 
-				Informant::format_bytes(report.state_db_mem),
-				Informant::format_bytes(cache_info.total()),
-				Informant::format_bytes(queue_info.mem_used),
-				Informant::format_bytes(sync_info.mem_used),
+				match maybe_sync {
+					Some(sync) => {
+						let sync_info = sync.status();
+						format!("{}/{} peers   {} ",
+							paint(Green.bold(), format!("{:2}", sync_info.num_active_peers)),
+							paint(Green.bold(), format!("{:2}", sync_info.num_peers)),
+							paint(Cyan.bold(), format!("{:>8}", format!("#{}", sync_info.last_imported_block_number.unwrap_or(chain_info.best_block_number)))),
+						)
+					}
+					None => String::new()
+				},
+
+				paint(Blue.bold(), format!("{:5}", queue_info.unverified_queue_size)),
+				paint(Blue.bold(), format!("{:5}", queue_info.verified_queue_size)),
+
+				paint(Purple.bold(), format!("{:>8}", Informant::format_bytes(report.state_db_mem))),
+				paint(Purple.bold(), format!("{:>8}", Informant::format_bytes(cache_info.total()))),
+				paint(Purple.bold(), format!("{:>8}", Informant::format_bytes(queue_info.mem_used))),
+				match maybe_sync {
+					Some(sync) => {
+						let sync_info = sync.status();
+						format!(" {} sync", paint(Purple.bold(), format!("{:>8}", Informant::format_bytes(sync_info.mem_used))))
+					}
+					None => String::new()
+				},
 			);
 		}
 

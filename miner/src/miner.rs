@@ -20,11 +20,14 @@ use std::sync::atomic::AtomicBool;
 use util::*;
 use util::keys::store::{AccountService, AccountProvider};
 use ethcore::views::{BlockView, HeaderView};
-use ethcore::client::{BlockChainClient, BlockId};
+use ethcore::client::{BlockChainClient, BlockID};
 use ethcore::block::{ClosedBlock, IsBlock};
 use ethcore::error::*;
 use ethcore::client::{Executive, Executed, EnvInfo, TransactOptions};
 use ethcore::transaction::SignedTransaction;
+use ethcore::receipt::{Receipt};
+use ethcore::spec::Spec;
+use ethcore::engine::Engine;
 use super::{MinerService, MinerStatus, TransactionQueue, AccountDetails, TransactionImportResult, TransactionOrigin};
 
 /// Keeps track of transactions using priority queue and holds currently mined block.
@@ -39,6 +42,7 @@ pub struct Miner {
 	gas_floor_target: RwLock<U256>,
 	author: RwLock<Address>,
 	extra_data: RwLock<Bytes>,
+	spec: Spec,
 
 	accounts: RwLock<Option<Arc<AccountService>>>,		// TODO: this is horrible since AccountService already contains a single RwLock field. refactor.
 }
@@ -55,13 +59,14 @@ impl Default for Miner {
 			author: RwLock::new(Address::default()),
 			extra_data: RwLock::new(Vec::new()),
 			accounts: RwLock::new(None),
+			spec: Spec::new_test(),
 		}
 	}
 }
 
 impl Miner {
 	/// Creates new instance of miner
-	pub fn new(force_sealing: bool) -> Arc<Miner> {
+	pub fn new(force_sealing: bool, spec: Spec) -> Arc<Miner> {
 		Arc::new(Miner {
 			transaction_queue: Mutex::new(TransactionQueue::new()),
 			force_sealing: force_sealing,
@@ -72,11 +77,12 @@ impl Miner {
 			author: RwLock::new(Address::default()),
 			extra_data: RwLock::new(Vec::new()),
 			accounts: RwLock::new(None),
+			spec: spec,
 		})
 	}
 
 	/// Creates new instance of miner
-	pub fn with_accounts(force_sealing: bool, accounts: Arc<AccountService>) -> Arc<Miner> {
+	pub fn with_accounts(force_sealing: bool, spec: Spec, accounts: Arc<AccountService>) -> Arc<Miner> {
 		Arc::new(Miner {
 			transaction_queue: Mutex::new(TransactionQueue::new()),
 			force_sealing: force_sealing,
@@ -87,11 +93,17 @@ impl Miner {
 			author: RwLock::new(Address::default()),
 			extra_data: RwLock::new(Vec::new()),
 			accounts: RwLock::new(Some(accounts)),
+			spec: spec,
 		})
+	}
+
+	fn engine(&self) -> &Engine {
+		self.spec.engine.deref()
 	}
 
 	/// Prepares new block for sealing including top transactions from queue.
 	#[cfg_attr(feature="dev", allow(match_same_arms))]
+	#[cfg_attr(feature="dev", allow(cyclomatic_complexity))]
 	fn prepare_sealing(&self, chain: &BlockChainClient) {
 		trace!(target: "miner", "prepare_sealing: entering");
 		let transactions = self.transaction_queue.lock().unwrap().top_transactions();
@@ -111,9 +123,9 @@ impl Miner {
 			Some(old_block) => {
 				trace!(target: "miner", "Already have previous work; updating and returning");
 				// add transactions to old_block
-				let e = chain.engine();
+				let e = self.engine();
 				let mut invalid_transactions = HashSet::new();
-				let mut block = old_block.reopen(e);
+				let mut block = old_block.reopen(e, chain.vm_factory());
 				let block_number = block.block().fields().header.number();
 
 				// TODO: push new uncles, too.
@@ -166,7 +178,7 @@ impl Miner {
 				trace!(target: "miner", "prepare_sealing: block has transaction - attempting internal seal.");
 				// block with transactions - see if we can seal immediately.
 				let a = self.accounts.read().unwrap();
-				let s = chain.generate_seal(block.block(), match *a.deref() {
+				let s = self.engine().generate_seal(block.block(), match *a.deref() {
 					Some(ref x) => Some(x.deref() as &AccountProvider),
 					None => None,
 				});
@@ -240,7 +252,7 @@ impl MinerService for Miner {
 		}
 	}
 
-	fn call(&self, chain: &BlockChainClient, t: &SignedTransaction) -> Result<Executed, Error> {
+	fn call(&self, chain: &BlockChainClient, t: &SignedTransaction) -> Result<Executed, ExecutionError> {
 		let sealing_work = self.sealing_work.lock().unwrap();
 		match sealing_work.peek_last_ref() {
 			Some(work) => {
@@ -258,13 +270,17 @@ impl MinerService for Miner {
 				};
 				// that's just a copy of the state.
 				let mut state = block.state().clone();
-				let sender = try!(t.sender());
+				let sender = try!(t.sender().map_err(|e| {
+					let message = format!("Transaction malformed: {:?}", e);
+					ExecutionError::TransactionMalformed(message)
+				}));
 				let balance = state.balance(&sender);
 				// give the sender max balance
 				state.sub_balance(&sender, &balance);
 				state.add_balance(&sender, &U256::max_value());
 				let options = TransactOptions { tracing: false, check_nonce: false };
-				Executive::new(&mut state, &env_info, chain.engine()).transact(t, options)
+
+				Executive::new(&mut state, &env_info, self.engine(), chain.vm_factory()).transact(t, options)
 			},
 			None => {
 				chain.call(t)
@@ -393,18 +409,54 @@ impl MinerService for Miner {
 	}
 
 	fn pending_transactions_hashes(&self) -> Vec<H256> {
-		let transaction_queue = self.transaction_queue.lock().unwrap();
-		transaction_queue.pending_hashes()
+		match (self.sealing_enabled.load(atomic::Ordering::Relaxed), self.sealing_work.lock().unwrap().peek_last_ref()) {
+			(true, Some(pending)) => pending.transactions().iter().map(|t| t.hash()).collect(),
+			_ => {
+				let queue = self.transaction_queue.lock().unwrap();
+				queue.pending_hashes()
+			}
+		}
 	}
 
 	fn transaction(&self, hash: &H256) -> Option<SignedTransaction> {
+		match (self.sealing_enabled.load(atomic::Ordering::Relaxed), self.sealing_work.lock().unwrap().peek_last_ref()) {
+			(true, Some(pending)) => pending.transactions().iter().find(|t| &t.hash() == hash).map(|t| t.clone()),
+			_ => {
+				let queue = self.transaction_queue.lock().unwrap();
+				queue.find(hash)
+			}
+		}
+	}
+
+	fn all_transactions(&self) -> Vec<SignedTransaction> {
 		let queue = self.transaction_queue.lock().unwrap();
-		queue.find(hash)
+		queue.top_transactions()
 	}
 
 	fn pending_transactions(&self) -> Vec<SignedTransaction> {
-		let queue = self.transaction_queue.lock().unwrap();
-		queue.top_transactions()
+		// TODO: should only use the sealing_work when it's current (it could be an old block)
+		match (self.sealing_enabled.load(atomic::Ordering::Relaxed), self.sealing_work.lock().unwrap().peek_last_ref()) {
+			(true, Some(pending)) => pending.transactions().clone(),
+			_ => {
+				let queue = self.transaction_queue.lock().unwrap();
+				queue.top_transactions()
+			}
+		}
+	}
+
+	fn pending_receipts(&self) -> BTreeMap<H256, Receipt> {
+		match (self.sealing_enabled.load(atomic::Ordering::Relaxed), self.sealing_work.lock().unwrap().peek_last_ref()) {
+			(true, Some(pending)) => {
+				let hashes = pending.transactions()
+					.iter()
+					.map(|t| t.hash());
+
+				let receipts = pending.receipts().clone().into_iter();
+
+				hashes.zip(receipts).collect()
+			},
+			_ => BTreeMap::new()
+		}
 	}
 
 	fn last_nonce(&self, address: &Address) -> Option<U256> {
@@ -445,15 +497,21 @@ impl MinerService for Miner {
 		if let Some(b) = self.sealing_work.lock().unwrap().take_used_if(|b| &b.hash() == &pow_hash) {
 			match chain.try_seal(b.lock(), seal) {
 				Err(_) => {
+					info!(target: "miner", "Mined block rejected, PoW was invalid.");
 					Err(Error::PowInvalid)
 				}
 				Ok(sealed) => {
+					info!(target: "miner", "New block mined, hash: {}", sealed.header().hash());
 					// TODO: commit DB from `sealed.drain` and make a VerifiedBlock to skip running the transactions twice.
-					try!(chain.import_block(sealed.rlp_bytes()));
+					let b = sealed.rlp_bytes();
+					let h = b.sha3();
+					try!(chain.import_block(b));
+					info!("Block {} submitted and imported.", h);
 					Ok(())
 				}
 			}
 		} else {
+			info!(target: "miner", "Mined block rejected, PoW hash invalid or out of date.");
 			Err(Error::PowHashInvalid)
 		}
 	}
@@ -461,7 +519,7 @@ impl MinerService for Miner {
 	fn chain_new_blocks(&self, chain: &BlockChainClient, _imported: &[H256], _invalid: &[H256], enacted: &[H256], retracted: &[H256]) {
 		fn fetch_transactions(chain: &BlockChainClient, hash: &H256) -> Vec<SignedTransaction> {
 			let block = chain
-				.block(BlockId::Hash(*hash))
+				.block(BlockID::Hash(*hash))
 				// Client should send message after commit to db and inserting to chain.
 				.expect("Expected in-chain blocks.");
 			let block = BlockView::new(&block);

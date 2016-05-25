@@ -24,9 +24,9 @@ use docopt::Docopt;
 
 use die::*;
 use util::*;
-use util::keys::store::AccountService;
+use util::keys::store::{ImportKeySet, AccountService};
 use util::network_settings::NetworkSettings;
-use ethcore::client::{append_path, get_db_path, ClientConfig, Switch};
+use ethcore::client::{append_path, get_db_path, ClientConfig, Switch, VMType};
 use ethcore::ethereum;
 use ethcore::spec::Spec;
 use ethsync::SyncConfig;
@@ -35,6 +35,11 @@ use rpc::IpcConfiguration;
 
 pub struct Configuration {
 	pub args: Args
+}
+
+pub struct Directories {
+	pub keys: String,
+	pub db: String,
 }
 
 impl Configuration {
@@ -58,11 +63,6 @@ impl Configuration {
 
 	fn max_peers(&self) -> u32 {
 		self.args.flag_maxpeers.unwrap_or(self.args.flag_peers) as u32
-	}
-
-	pub fn path(&self) -> String {
-		let d = self.args.flag_datadir.as_ref().unwrap_or(&self.args.flag_db_path);
-		d.replace("$HOME", env::home_dir().unwrap().to_str().unwrap())
 	}
 
 	pub fn author(&self) -> Address {
@@ -91,11 +91,18 @@ impl Configuration {
 					die!("{}: Invalid basic transaction price given in USD. Must be a decimal number.", self.args.flag_usd_per_tx)
 				});
 				let usd_per_eth = match self.args.flag_usd_per_eth.as_str() {
+					"auto" => PriceInfo::get().map_or_else(|| {
+						let last_known_good = 9.69696;
+						// TODO: use #1083 to read last known good value.
+						last_known_good
+					}, |x| x.ethusd),
 					"etherscan" => PriceInfo::get().map_or_else(|| {
 						die!("Unable to retrieve USD value of ETH from etherscan. Rerun with a different value for --usd-per-eth.")
 					}, |x| x.ethusd),
 					x => FromStr::from_str(x).unwrap_or_else(|_| die!("{}: Invalid ether price given in USD. Must be a decimal number.", x))
 				};
+				// TODO: use #1083 to write last known good value as use_per_eth.
+
 				let wei_per_usd: f32 = 1.0e18 / usd_per_eth;
 				let gas_per_tx: f32 = 21000.0;
 				let wei_per_gas: f32 = wei_per_usd * usd_per_tx / gas_per_tx;
@@ -111,10 +118,6 @@ impl Configuration {
 			None => version_data(),
 			Some(ref x) => { die!("{}: Extra data must be at most 32 characters.", x); }
 		}
-	}
-
-	pub fn keys_path(&self) -> String {
-		self.args.flag_keys_path.replace("$HOME", env::home_dir().unwrap().to_str().unwrap())
 	}
 
 	pub fn spec(&self) -> Spec {
@@ -168,7 +171,7 @@ impl Configuration {
 		let (listen, public) = self.net_addresses();
 		ret.listen_address = listen;
 		ret.public_address = public;
-		ret.use_secret = self.args.flag_node_key.as_ref().map(|s| Secret::from_str(&s).unwrap_or_else(|_| s.sha3()));
+		ret.use_secret = self.args.flag_node_key.as_ref().map(|s| Secret::from_str(s).unwrap_or_else(|_| s.sha3()));
 		ret.discovery_enabled = !self.args.flag_no_discovery && !self.args.flag_nodiscover;
 		ret.ideal_peers = self.max_peers();
 		let mut net_path = PathBuf::from(&self.path());
@@ -182,7 +185,7 @@ impl Configuration {
 		let mut latest_era = None;
 		let jdb_types = [journaldb::Algorithm::Archive, journaldb::Algorithm::EarlyMerge, journaldb::Algorithm::OverlayRecent, journaldb::Algorithm::RefCounted];
 		for i in jdb_types.into_iter() {
-			let db = journaldb::new(&append_path(&get_db_path(&Path::new(&self.path()), *i, spec.genesis_header().hash()), "state"), *i);
+			let db = journaldb::new(&append_path(&get_db_path(Path::new(&self.path()), *i, spec.genesis_header().hash()), "state"), *i);
 			trace!(target: "parity", "Looking for best DB: {} at {:?}", i, db.latest_era());
 			match (latest_era, db.latest_era()) {
 				(Some(best), Some(this)) if best >= this => {}
@@ -198,6 +201,7 @@ impl Configuration {
 
 	pub fn client_config(&self, spec: &Spec) -> ClientConfig {
 		let mut client_config = ClientConfig::default();
+
 		match self.args.flag_cache {
 			Some(mb) => {
 				client_config.blockchain.max_cache_size = mb * 1024 * 1024;
@@ -208,20 +212,27 @@ impl Configuration {
 				client_config.blockchain.max_cache_size = self.args.flag_cache_max_size;
 			}
 		}
+
 		client_config.tracing.enabled = match self.args.flag_tracing.as_str() {
 			"auto" => Switch::Auto,
 			"on" => Switch::On,
 			"off" => Switch::Off,
 			_ => { die!("Invalid tracing method given!") }
 		};
+
 		client_config.pruning = match self.args.flag_pruning.as_str() {
 			"archive" => journaldb::Algorithm::Archive,
 			"light" => journaldb::Algorithm::EarlyMerge,
 			"fast" => journaldb::Algorithm::OverlayRecent,
 			"basic" => journaldb::Algorithm::RefCounted,
-			"auto" => self.find_best_db(spec).unwrap_or(journaldb::Algorithm::OverlayRecent),
+			"auto" => self.find_best_db(spec).unwrap_or(journaldb::Algorithm::Archive),
 			_ => { die!("Invalid pruning method given."); }
 		};
+
+		if self.args.flag_jitvm {
+			client_config.vm_type = VMType::jit().unwrap_or_else(|| die!("Parity built without jit vm."))
+		}
+
 		trace!(target: "parity", "Using pruning strategy of {}", client_config.pruning);
 		client_config.name = self.args.flag_identity.clone();
 		client_config.queue.max_mem_use = self.args.flag_queue_max_size;
@@ -245,10 +256,15 @@ impl Configuration {
 				.collect::<Vec<_>>()
 				.into_iter()
 		}).collect::<Vec<_>>();
-		let account_service = AccountService::new_in(Path::new(&self.keys_path()));
+		let import_keys = match (self.args.flag_no_import_keys, self.args.flag_testnet) {
+			(true, _) => ImportKeySet::None,
+			(false, false) => ImportKeySet::Legacy,
+			(false, true) => ImportKeySet::LegacyTestnet,
+		};
+		let account_service = AccountService::with_security(Path::new(&self.keys_path()), self.keys_iterations(), import_keys);
 		if let Some(ref unlocks) = self.args.flag_unlock {
 			for d in unlocks.split(',') {
-				let a = Address::from_str(clean_0x(&d)).unwrap_or_else(|_| {
+				let a = Address::from_str(clean_0x(d)).unwrap_or_else(|_| {
 					die!("{}: Invalid address for --unlock. Must be 40 hex characters, without the 0x at the beginning.", d)
 				});
 				if passwords.iter().find(|p| account_service.unlock_account_no_expire(&a, p).is_ok()).is_none() {
@@ -263,23 +279,23 @@ impl Configuration {
 		self.args.flag_rpcapi.clone().unwrap_or(self.args.flag_jsonrpc_apis.clone())
 	}
 
-	pub fn rpc_cors(&self) -> Option<String> {
-		self.args.flag_jsonrpc_cors.clone().or(self.args.flag_rpccorsdomain.clone())
+	pub fn rpc_cors(&self) -> Vec<String> {
+		let cors = self.args.flag_jsonrpc_cors.clone().or(self.args.flag_rpccorsdomain.clone());
+		cors.map_or_else(Vec::new, |c| c.split(',').map(|s| s.to_owned()).collect())
 	}
-	
-	fn geth_ipc_path() -> &'static str {
-		if cfg!(target_os = "macos") {
-			"$HOME/Library/Ethereum/geth.ipc"
-		} else {
-			"$HOME/.ethereum/geth.ipc"
-		}
+
+	fn geth_ipc_path() -> String {
+		path::ethereum::with_default("geth.ipc").to_str().unwrap().to_owned()
+	}
+
+	pub fn keys_iterations(&self) -> u32 {
+		self.args.flag_keys_iterations
 	}
 
 	pub fn ipc_settings(&self) -> IpcConfiguration {
 		IpcConfiguration {
 			enabled: !(self.args.flag_ipcdisable || self.args.flag_ipc_off),
-			socket_addr: if self.args.flag_geth { Self::geth_ipc_path().to_owned() } else { self.args.flag_ipcpath.clone().unwrap_or(self.args.flag_ipc_path.clone()) }
-				.replace("$HOME", env::home_dir().unwrap().to_str().unwrap()),
+			socket_addr: self.ipc_path(),
 			apis: self.args.flag_ipcapi.clone().unwrap_or(self.args.flag_ipc_apis.clone()),
 		}
 	}
@@ -295,6 +311,43 @@ impl Configuration {
 			rpc_interface: self.args.flag_rpcaddr.clone().unwrap_or(self.args.flag_jsonrpc_interface.clone()),
 			rpc_port: self.args.flag_rpcport.unwrap_or(self.args.flag_jsonrpc_port),
 		}
+	}
+
+	pub fn directories(&self) -> Directories {
+		let db_path = Configuration::replace_home(
+			self.args.flag_datadir.as_ref().unwrap_or(&self.args.flag_db_path));
+		::std::fs::create_dir_all(&db_path).unwrap_or_else(|e| die_with_io_error("main", e));
+
+		let keys_path = Configuration::replace_home(
+			if self.args.flag_testnet {
+				"$HOME/.parity/testnet_keys"
+			} else {
+				&self.args.flag_keys_path
+			}
+		);
+		::std::fs::create_dir_all(&db_path).unwrap_or_else(|e| die_with_io_error("main", e));
+
+		Directories {
+			keys: keys_path,
+			db: db_path,
+		}
+	}
+
+	pub fn keys_path(&self) -> String {
+		self.directories().keys
+	}
+
+	pub fn path(&self) -> String {
+		self.directories().db
+	}
+
+	fn replace_home(arg: &str) -> String {
+		arg.replace("$HOME", env::home_dir().unwrap().to_str().unwrap())
+	}
+
+	fn ipc_path(&self) -> String {
+		if self.args.flag_geth { Self::geth_ipc_path() }
+		else { Configuration::replace_home(&self.args.flag_ipcpath.clone().unwrap_or(self.args.flag_ipc_path.clone())) }
 	}
 }
 
@@ -338,7 +391,7 @@ mod tests {
 			assert_eq!(net.rpc_enabled, true);
 			assert_eq!(net.rpc_interface, "all".to_owned());
 			assert_eq!(net.rpc_port, 8000);
-			assert_eq!(conf.rpc_cors(), Some("*".to_owned()));
+			assert_eq!(conf.rpc_cors(), vec!["*".to_owned()]);
 			assert_eq!(conf.rpc_apis(), "web3,eth".to_owned());
 		}
 

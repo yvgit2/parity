@@ -21,7 +21,7 @@ use jsonrpc_core::IoHandler;
 use util::hash::{Address, H256, FixedHash};
 use util::numbers::{Uint, U256};
 use util::keys::{TestAccount, TestAccountProvider};
-use ethcore::client::{TestBlockChainClient, EachBlockWith, Executed, TransactionId};
+use ethcore::client::{TestBlockChainClient, EachBlockWith, Executed, TransactionID};
 use ethcore::log_entry::{LocalizedLogEntry, LogEntry};
 use ethcore::receipt::LocalizedReceipt;
 use ethcore::transaction::{Transaction, Action};
@@ -522,6 +522,81 @@ fn rpc_eth_send_transaction() {
 }
 
 #[test]
+fn rpc_eth_sign_and_send_transaction_with_invalid_password() {
+	let account = TestAccount::new("password123");
+	let address = account.address();
+
+	let tester = EthTester::default();
+	tester.accounts_provider.accounts.write().unwrap().insert(address.clone(), account);
+	let request = r#"{
+		"jsonrpc": "2.0",
+		"method": "eth_signAndSendTransaction",
+		"params": [{
+			"from": ""#.to_owned() + format!("0x{:?}", address).as_ref() + r#"",
+			"to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+			"gas": "0x76c0",
+			"gasPrice": "0x9184e72a000",
+			"value": "0x9184e72a"
+		}, "password321"],
+		"id": 1
+	}"#;
+
+	let response = r#"{"jsonrpc":"2.0","result":"0x0000000000000000000000000000000000000000000000000000000000000000","id":1}"#;
+
+	assert_eq!(tester.io.handle_request(request.as_ref()), Some(response.into()));
+}
+
+#[test]
+fn rpc_eth_sign_and_send_transaction() {
+	let account = TestAccount::new("password123");
+	let address = account.address();
+	let secret = account.secret.clone();
+
+	let tester = EthTester::default();
+	tester.accounts_provider.accounts.write().unwrap().insert(address.clone(), account);
+	let request = r#"{
+		"jsonrpc": "2.0",
+		"method": "eth_signAndSendTransaction",
+		"params": [{
+			"from": ""#.to_owned() + format!("0x{:?}", address).as_ref() + r#"",
+			"to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+			"gas": "0x76c0",
+			"gasPrice": "0x9184e72a000",
+			"value": "0x9184e72a"
+		}, "password123"],
+		"id": 1
+	}"#;
+
+	let t = Transaction {
+		nonce: U256::zero(),
+		gas_price: U256::from(0x9184e72a000u64),
+		gas: U256::from(0x76c0),
+		action: Action::Call(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap()),
+		value: U256::from(0x9184e72au64),
+		data: vec![]
+	}.sign(&secret);
+
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+
+	assert_eq!(tester.io.handle_request(request.as_ref()), Some(response));
+
+	tester.miner.last_nonces.write().unwrap().insert(address.clone(), U256::zero());
+
+	let t = Transaction {
+		nonce: U256::one(),
+		gas_price: U256::from(0x9184e72a000u64),
+		gas: U256::from(0x76c0),
+		action: Action::Call(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap()),
+		value: U256::from(0x9184e72au64),
+		data: vec![]
+	}.sign(&secret);
+
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+
+	assert_eq!(tester.io.handle_request(request.as_ref()), Some(response));
+}
+
+#[test]
 #[ignore]
 fn rpc_eth_send_raw_transaction() {
 	unimplemented!()
@@ -562,7 +637,7 @@ fn rpc_eth_transaction_receipt() {
 
 	let hash = H256::from_str("b903239f8543d04b5dc1ba6579132b143087c68db1b2168786408fcbce568238").unwrap();
 	let tester = EthTester::default();
-	tester.client.set_transaction_receipt(TransactionId::Hash(hash), receipt);
+	tester.client.set_transaction_receipt(TransactionID::Hash(hash), receipt);
 
 	let request = r#"{
 		"jsonrpc": "2.0",
@@ -570,7 +645,7 @@ fn rpc_eth_transaction_receipt() {
 		"params": ["0xb903239f8543d04b5dc1ba6579132b143087c68db1b2168786408fcbce568238"],
 		"id": 1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x04510c","contractAddress":null,"cumulativeGasUsed":"0x20","gasUsed":"0x10","logs":[{"address":"0x33990122638b9132ca29c723bdf037f1a891a70c","blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x04510c","data":"0x","logIndex":"0x01","topics":["0xa6697e974e6a320f454390be03f74955e8978f1a6971ea6730542e37b66179bc","0x4861736852656700000000000000000000000000000000000000000000000000"],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x00"}],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x00"},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x04510c","contractAddress":null,"cumulativeGasUsed":"0x20","gasUsed":"0x10","logs":[{"address":"0x33990122638b9132ca29c723bdf037f1a891a70c","blockHash":"0xed76641c68a1c641aee09a94b3b471f4dc0316efe5ac19cf488e2674cf8d05b5","blockNumber":"0x04510c","data":"0x","logIndex":"0x01","topics":["0xa6697e974e6a320f454390be03f74955e8978f1a6971ea6730542e37b66179bc","0x4861736852656700000000000000000000000000000000000000000000000000"],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x00","type":"mined"}],"transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000000","transactionIndex":"0x00"},"id":1}"#;
 
 	assert_eq!(tester.io.handle_request(request), Some(response.to_owned()));
 }

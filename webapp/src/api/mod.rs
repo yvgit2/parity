@@ -14,29 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use util::H256;
-use super::trace::{Action, Res};
-use header::BlockNumber;
+//! REST API
 
-/// Localized trace.
-#[derive(Debug, PartialEq)]
-pub struct LocalizedTrace {
-	/// Type of action performed by a transaction.
-	pub action: Action,
-	/// Result of this action.
-	pub result: Res,
-	/// Number of subtraces.
-	pub subtraces: usize,
-	/// Exact location of trace.
-	///
-	/// [index in root, index in first CALL, index in second CALL, ...]
-	pub trace_address: Vec<usize>,
-	/// Transaction number within the block.
-	pub transaction_number: usize,
-	/// Signed transaction hash.
-	pub transaction_hash: H256,
-	/// Block number.
-	pub block_number: BlockNumber,
-	/// Block hash.
-	pub block_hash: H256,
-}
+#![warn(missing_docs)]
+#![cfg_attr(feature="nightly", feature(custom_derive, custom_attribute, plugin))]
+#![cfg_attr(feature="nightly", plugin(serde_macros, clippy))]
+
+#[cfg(feature = "serde_macros")]
+include!("mod.rs.in");
+
+#[cfg(not(feature = "serde_macros"))]
+include!(concat!(env!("OUT_DIR"), "/mod.rs"));
+

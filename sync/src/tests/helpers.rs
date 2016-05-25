@@ -16,6 +16,7 @@
 
 use util::*;
 use ethcore::client::{TestBlockChainClient, BlockChainClient};
+use ethcore::spec::Spec;
 use io::SyncIo;
 use chain::ChainSync;
 use ethminer::Miner;
@@ -91,9 +92,11 @@ impl TestNet {
 			started: false,
 		};
 		for _ in 0..n {
+			let chain = TestBlockChainClient::new();
+			let sync = ChainSync::new(SyncConfig::default(), Miner::new(false, Spec::new_test()), &chain);
 			net.peers.push(TestPeer {
-				chain: TestBlockChainClient::new(),
-				sync: ChainSync::new(SyncConfig::default(), Miner::new(false)),
+				sync: sync,
+				chain: chain,
 				queue: VecDeque::new(),
 			});
 		}
@@ -147,7 +150,7 @@ impl TestNet {
 		let mut total_steps = 0;
 		while !self.done() {
 			self.sync_step();
-			total_steps = total_steps + 1;
+			total_steps += 1;
 		}
 		total_steps
 	}

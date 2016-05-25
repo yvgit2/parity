@@ -19,7 +19,7 @@
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::io;
-use hash::{Address, FixedHash};
+use hash::Address;
 use crypto::{Secret, KeyPair};
 use super::store::{AccountProvider, SigningError, EncryptedHashMapError};
 
@@ -82,6 +82,11 @@ impl AccountProvider for TestAccountProvider {
 		}
 	}
 
+	fn unlock_account_temp(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
+		// TODO; actually make it relock on use
+		self.unlock_account(account, pass)
+	}
+
 	fn new_account(&self, pass: &str) -> Result<Address, io::Error> {
 		let account = TestAccount::new(pass);
 		let address = KeyPair::from_secret(account.secret.clone()).unwrap().address();
@@ -97,6 +102,17 @@ impl AccountProvider for TestAccountProvider {
 			.get(address)
 			.ok_or(SigningError::NoAccount)
 			.map(|acc| acc.secret.clone())
+	}
+
+	fn locked_account_secret(&self, address: &Address, pass: &str) -> Result<Secret, SigningError> {
+		let accounts = self.accounts.read().unwrap();
+		match accounts.get(address) {
+			Some(ref acc) if acc.password == pass => {
+				Ok(acc.secret.clone())
+			},
+			Some(ref _acc) => Err(SigningError::InvalidPassword),
+			_ => Err(SigningError::NoAccount),
+		}
 	}
 }
 

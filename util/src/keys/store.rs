@@ -58,13 +58,15 @@ pub enum EncryptedHashMapError {
 	InvalidValueFormat(FromBytesError),
 }
 
-/// Error retrieving value from encrypted hashmap
+/// Error while signing a message
 #[derive(Debug)]
 pub enum SigningError {
 	/// Account passed does not exist
 	NoAccount,
 	/// Account passed is not unlocked
 	AccountNotUnlocked,
+	/// Invalid passphrase
+	InvalidPassword,
 	/// Invalid secret in store
 	InvalidSecret
 }
@@ -73,12 +75,15 @@ pub enum SigningError {
 pub struct SecretStore {
 	directory: KeyDirectory,
 	unlocks: RwLock<HashMap<Address, AccountUnlock>>,
+	key_iterations: u32,
 }
 
 struct AccountUnlock {
 	secret: H256,
 	/// expiration datetime (None - never)
 	expires: Option<DateTime<UTC>>,
+	/// Sccount should be relocked after first use.
+	relock_on_use: bool,
 }
 
 /// Basic account management trait
@@ -87,10 +92,14 @@ pub trait AccountProvider : Send + Sync {
 	fn accounts(&self) -> Result<Vec<Address>, ::std::io::Error>;
 	/// Unlocks account with the password provided
 	fn unlock_account(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError>;
+	/// Unlocks account with the password provided; relocks it on the next call to `account_secret` or `sign`.
+	fn unlock_account_temp(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError>;
 	/// Creates account
 	fn new_account(&self, pass: &str) -> Result<Address, ::std::io::Error>;
 	/// Returns secret for unlocked `account`.
 	fn account_secret(&self, account: &Address) -> Result<crypto::Secret, SigningError>;
+	/// Returns secret for locked account given passphrase.
+	fn locked_account_secret(&self, account: &Address, pass: &str) -> Result<crypto::Secret, SigningError>;
 	/// Returns signature when unlocked `account` signs `message`.
 	fn sign(&self, account: &Address, message: &H256) -> Result<crypto::Signature, SigningError> {
 		self.account_secret(account).and_then(|s| crypto::ec::sign(&s, message).map_err(|_| SigningError::InvalidSecret))
@@ -111,6 +120,9 @@ impl AccountProvider for AccountService {
 	fn unlock_account(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
 		self.secret_store.read().unwrap().unlock_account(account, pass)
 	}
+	fn unlock_account_temp(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
+		self.secret_store.read().unwrap().unlock_account_temp(account, pass)
+	}
 	/// Creates account
 	fn new_account(&self, pass: &str) -> Result<Address, ::std::io::Error> {
 		self.secret_store.write().unwrap().new_account(pass)
@@ -119,19 +131,37 @@ impl AccountProvider for AccountService {
 	fn account_secret(&self, account: &Address) -> Result<crypto::Secret, SigningError> {
 		self.secret_store.read().unwrap().account_secret(account)
 	}
-	/// Returns secret for unlocked account
+	/// Returns secret for locked account given passphrase.
+	fn locked_account_secret(&self, account: &Address, pass: &str) -> Result<crypto::Secret, SigningError> {
+		self.secret_store.read().unwrap().locked_account_secret(account, pass)
+	}
+	/// Signs a message using key of given unlocked account address.
 	fn sign(&self, account: &Address, message: &H256) -> Result<crypto::Signature, SigningError> {
 		self.secret_store.read().unwrap().sign(account, message)
 	}
 }
 
+/// Which set of keys to import.
+#[derive(PartialEq)]
+pub enum ImportKeySet {
+	/// Empty set.
+	None,
+	/// Import legacy client's general keys.
+	Legacy,
+	/// Import legacy client's testnet keys.
+	LegacyTestnet,
+}
+
 impl AccountService {
-	/// New account service with the keys store in specific location
-	pub fn new_in(path: &Path) -> Self {
-		let secret_store = RwLock::new(SecretStore::new_in(path));
-		secret_store.write().unwrap().try_import_existing();
+	/// New account service with the keys store in specific location and configured security parameters.
+	pub fn with_security(path: &Path, key_iterations: u32, import_keys: ImportKeySet) -> Self {
+		let secret_store = RwLock::new(SecretStore::with_security(path, key_iterations));
+		match import_keys {
+			ImportKeySet::None => {}
+			_ => { secret_store.write().unwrap().try_import_existing(import_keys == ImportKeySet::LegacyTestnet); }
+		}
 		AccountService {
-			secret_store: secret_store
+			secret_store: secret_store,
 		}
 	}
 
@@ -150,25 +180,31 @@ impl AccountService {
 
 	/// Unlocks account for use (no expiration of unlock)
 	pub fn unlock_account_no_expire(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
-		self.secret_store.write().unwrap().unlock_account_with_expiration(account, pass, None)
+		self.secret_store.write().unwrap().unlock_account_with_expiration(account, pass, None, false)
 	}
 }
 
 impl SecretStore {
 	/// new instance of Secret Store in specific directory
 	pub fn new_in(path: &Path) -> Self {
+		SecretStore::with_security(path, KEY_ITERATIONS)
+	}
+
+	/// new instance of Secret Store in specific directory and configured security parameters
+	pub fn with_security(path: &Path, key_iterations: u32) -> Self {
 		::std::fs::create_dir_all(&path).expect("Cannot access requested key directory - critical");
 		SecretStore {
 			directory: KeyDirectory::new(path),
 			unlocks: RwLock::new(HashMap::new()),
+			key_iterations: key_iterations,
 		}
 	}
 
 	/// trys to import keys in the known locations
-	pub fn try_import_existing(&mut self) {
+	pub fn try_import_existing(&mut self, is_testnet: bool) {
 		use keys::geth_import;
 
-		let import_path = geth_import::keystore_dir();
+		let import_path = geth_import::keystore_dir(is_testnet);
 		if let Err(e) = geth_import::import_geth_keys(self, &import_path) {
 			trace!(target: "sstore", "Geth key not imported: {:?}", e);
 		}
@@ -206,26 +242,32 @@ impl SecretStore {
 		SecretStore {
 			directory: KeyDirectory::new(path.as_path()),
 			unlocks: RwLock::new(HashMap::new()),
+			key_iterations: KEY_ITERATIONS,
 		}
 	}
 
 	/// Unlocks account for use
 	pub fn unlock_account(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
-		self.unlock_account_with_expiration(account, pass, Some(UTC::now() + Duration::minutes(20)))
+		self.unlock_account_with_expiration(account, pass, Some(UTC::now() + Duration::minutes(20)), false)
 	}
 
 	/// Unlocks account for use (no expiration of unlock)
 	pub fn unlock_account_no_expire(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
-		self.unlock_account_with_expiration(account, pass, None)
+		self.unlock_account_with_expiration(account, pass, None, false)
 	}
 
-	fn unlock_account_with_expiration(&self, account: &Address, pass: &str, expiration: Option<DateTime<UTC>>) -> Result<(), EncryptedHashMapError> {
+	/// Unlocks account for use (no expiration of unlock)
+	pub fn unlock_account_temp(&self, account: &Address, pass: &str) -> Result<(), EncryptedHashMapError> {
+		self.unlock_account_with_expiration(account, pass, None, true)
+	}
+
+	fn unlock_account_with_expiration(&self, account: &Address, pass: &str, expiration: Option<DateTime<UTC>>, relock_on_use: bool) -> Result<(), EncryptedHashMapError> {
 		let secret_id = try!(self.account(&account).ok_or(EncryptedHashMapError::UnknownIdentifier));
 		let secret = try!(self.get(&secret_id, pass));
 		{
 			let mut write_lock = self.unlocks.write().unwrap();
 			let mut unlock = write_lock.entry(*account)
-				.or_insert_with(|| AccountUnlock { secret: secret, expires: Some(UTC::now()) });
+				.or_insert_with(|| AccountUnlock { secret: secret, expires: Some(UTC::now()), relock_on_use: relock_on_use });
 			unlock.secret = secret;
 			unlock.expires = expiration;
 		}
@@ -245,24 +287,52 @@ impl SecretStore {
 		Ok(address)
 	}
 
-	/// Signs message with unlocked account
+	/// Signs message with unlocked account.
 	pub fn sign(&self, account: &Address, message: &H256) -> Result<crypto::Signature, SigningError> {
-		let read_lock = self.unlocks.read().unwrap();
-		let unlock = try!(read_lock.get(account).ok_or(SigningError::AccountNotUnlocked));
-		match crypto::KeyPair::from_secret(unlock.secret) {
-			Ok(pair) => match pair.sign(message) {
-					Ok(signature) => Ok(signature),
+		let (relock, ret) = {
+			let read_lock = self.unlocks.read().unwrap();
+			if let Some(unlock) = read_lock.get(account) {
+				(unlock.relock_on_use, match crypto::KeyPair::from_secret(unlock.secret) {
+					Ok(pair) => match pair.sign(message) {
+							Ok(signature) => Ok(signature),
+							Err(_) => Err(SigningError::InvalidSecret)
+						},
 					Err(_) => Err(SigningError::InvalidSecret)
-				},
-			Err(_) => Err(SigningError::InvalidSecret)
+				})
+			} else {
+				(false, Err(SigningError::AccountNotUnlocked))
+			}
+		};
+		if relock {
+			self.unlocks.write().unwrap().remove(account);
 		}
+		ret
 	}
 
-	/// Returns secret for unlocked account
+	/// Returns secret for unlocked account.
 	pub fn account_secret(&self, account: &Address) -> Result<crypto::Secret, SigningError> {
-		let read_lock = self.unlocks.read().unwrap();
-		let unlock = try!(read_lock.get(account).ok_or(SigningError::AccountNotUnlocked));
-		Ok(unlock.secret as crypto::Secret)
+		let (relock, ret) = {
+			let read_lock = self.unlocks.read().unwrap();
+			if let Some(unlock) = read_lock.get(account) {
+				(unlock.relock_on_use, Ok(unlock.secret as crypto::Secret))
+			} else {
+				(false, Err(SigningError::AccountNotUnlocked))
+			}
+		};
+		if relock {
+			self.unlocks.write().unwrap().remove(account);
+		}
+		ret
+	}
+
+	/// Returns secret for unlocked account.
+	pub fn locked_account_secret(&self, account: &Address, pass: &str) -> Result<crypto::Secret, SigningError> {
+		let secret_id = try!(self.account(&account).ok_or(SigningError::NoAccount));
+		self.get(&secret_id, pass).or_else(|e| Err(match e {
+			EncryptedHashMapError::InvalidPassword => SigningError::InvalidPassword,
+			EncryptedHashMapError::UnknownIdentifier => SigningError::NoAccount,
+			EncryptedHashMapError::InvalidValueFormat(_) => SigningError::InvalidSecret,
+		}))
 	}
 
 	/// Makes account unlocks expire and removes unused key files from memory
@@ -289,8 +359,8 @@ fn derive_key_iterations(password: &str, salt: &H256, c: u32) -> (Bytes, Bytes) 
 	(derived_right_bits.to_vec(), derived_left_bits.to_vec())
 }
 
-fn derive_key(password: &str, salt: &H256) -> (Bytes, Bytes) {
-	derive_key_iterations(password, salt, KEY_ITERATIONS)
+fn derive_key(password: &str, salt: &H256, iterations: u32) -> (Bytes, Bytes) {
+	derive_key_iterations(password, salt, iterations)
 }
 
 fn derive_key_scrypt(password: &str, salt: &H256, n: u32, p: u32, r: u32) -> (Bytes, Bytes) {
@@ -346,7 +416,7 @@ impl EncryptedHashMap<H128> for SecretStore {
 
 		// two parts of derived key
 		// DK = [ DK[0..15] DK[16..31] ] = [derived_left_bits, derived_right_bits]
-		let (derived_left_bits, derived_right_bits) = derive_key(password, &salt);
+		let (derived_left_bits, derived_right_bits) = derive_key(password, &salt, self.key_iterations);
 
 		let mut cipher_text = vec![0u8; value.as_slice().len()];
 		// aes-128-ctr with initial vector of iv
@@ -361,7 +431,7 @@ impl EncryptedHashMap<H128> for SecretStore {
 				iv,
 				salt,
 				mac,
-				KEY_ITERATIONS,
+				self.key_iterations,
 				KEY_LENGTH));
 		key_file.id = key;
 		if let Err(io_error) = self.directory.save(key_file) {
@@ -561,6 +631,30 @@ mod tests {
 	}
 
 	#[test]
+	fn can_relock_temp_account() {
+		let temp = RandomTempPath::create_dir();
+		let address = {
+			let mut sstore = SecretStore::new_test(&temp);
+			sstore.new_account("334").unwrap()
+		};
+		let signature = {
+			let sstore = SecretStore::new_test(&temp);
+			sstore.unlock_account_temp(&address, "334").unwrap();
+			sstore.sign(&address, &H256::random()).unwrap();
+			sstore.sign(&address, &H256::random())
+		};
+		assert!(signature.is_err());
+
+		let secret = {
+			let sstore = SecretStore::new_test(&temp);
+			sstore.unlock_account_temp(&address, "334").unwrap();
+			sstore.account_secret(&address).unwrap();
+			sstore.account_secret(&address)
+		};
+		assert!(secret.is_err());
+	}
+
+	#[test]
 	fn can_import_account() {
 		use keys::directory::{KeyFileContent, KeyFileCrypto};
 		let temp = RandomTempPath::create_dir();
@@ -602,6 +696,29 @@ mod tests {
 		let kp = KeyPair::from_secret(secret).unwrap();
 		assert_eq!(Address::from(kp.public().sha3()), addr);
 	}
+
+
+	#[test]
+	fn secret_for_locked_account() {
+		// given
+		let temp = RandomTempPath::create_dir();
+		let mut sstore = SecretStore::new_test(&temp);
+		let addr = sstore.new_account("test-pass").unwrap();
+
+		// when
+		// Invalid pass
+		let secret1 = sstore.locked_account_secret(&addr, "test-pass123");
+		// Valid pass
+		let secret2 = sstore.locked_account_secret(&addr, "test-pass");
+		// Account not unlocked
+		let secret3 = sstore.account_secret(&addr);
+
+
+		assert!(secret1.is_err(), "Invalid password should not return secret.");
+		assert!(secret2.is_ok(), "Should return secret provided valid passphrase.");
+		assert!(secret3.is_err(), "Account should still be locked.");
+	}
+
 
 	#[test]
 	fn can_create_service() {

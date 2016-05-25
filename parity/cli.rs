@@ -24,6 +24,8 @@ Parity. Ethereum Client.
 Usage:
   parity daemon <pid-file> [options]
   parity account (new | list) [options]
+  parity import [ <file> ] [options]
+  parity export [ <file> ] [options]
   parity [options]
 
 Protocol Options:
@@ -42,6 +44,10 @@ Account Options:
                            ACCOUNTS is a comma-delimited list of addresses.
   --password FILE          Provide a file containing a password for unlocking
                            an account.
+  --keys-iterations NUM    Specify the number of iterations to use when
+                           deriving key from the password (bigger is more
+                           secure) [default: 10240].
+  --no-import-keys         Do not import keys from legacy clients.
 
 Networking Options:
   --port PORT              Override the port on which the node should listen
@@ -99,7 +105,9 @@ Sealing/Mining Options:
                            [default: 0.005]. The minimum gas price is set
                            accordingly.
   --usd-per-eth SOURCE     USD value of a single ETH. SOURCE may be either an
-                           amount in USD or a web service [default: etherscan].
+                           amount in USD, a web service or 'auto' to use each
+                           web service in turn and fallback on the last known
+                           good value [default: auto].
   --gas-floor-target GAS   Amount of gas per block to target when sealing a new
                            block [default: 4712388].
   --author ADDRESS         Specify the block author (aka "coinbase") address
@@ -112,17 +120,18 @@ Sealing/Mining Options:
 
 Footprint Options:
   --tracing BOOL           Indicates if full transaction tracing should be
-                           enabled. Works only if client had been fully synced with
-                           tracing enabled. BOOL may be one of auto, on, off.
-                           auto uses last used value of this option (off if it does
-                           not exist) [default: auto].
+                           enabled. Works only if client had been fully synced
+                           with tracing enabled. BOOL may be one of auto, on,
+                           off. auto uses last used value of this option (off
+                           if it does not exist) [default: auto].
   --pruning METHOD         Configure pruning of the state/storage trie. METHOD
-                           may be one of auto, archive, basic, fast, light:
+                           may be one of auto, archive, fast, basic, light:
                            archive - keep all state trie data. No pruning.
-                           basic - reference count in disk DB. Slow but light.
                            fast - maintain journal overlay. Fast but 50MB used.
-                           light - early merges with partial tracking. Fast
-                           and light. Experimental!
+                           basic - reference count in disk DB. Slow, light, and
+                           experimental!
+                           light - early merges with partial tracking. Fast,
+                           light, and experimental!
                            auto - use the method most recently synced or
                            default to archive if none synced [default: auto].
   --cache-pref-size BYTES  Specify the prefered size of the blockchain cache in
@@ -135,12 +144,25 @@ Footprint Options:
                            the entire system, overrides other cache and queue
                            options.
 
+Import/Export Options:
+  --from BLOCK             Export from block BLOCK, which may be an index or
+                           hash [default: 1].
+  --to BLOCK               Export to (including) block BLOCK, which may be an
+                           index, hash or 'latest' [default: latest].
+  --format FORMAT          For import/export in given format. FORMAT must be
+                           one of 'hex' and 'binary'.
+
+Virtual Machine Options:
+  --jitvm                  Enable the JIT VM.
+
 Legacy Options:
   --geth                   Run in Geth-compatibility mode. Currently just sets
                            the IPC path to be the same as Geth's. Overrides
                            the --ipc-path/--ipcpath options.
+  --testnet                Geth-compatible testnet mode. Equivalent to --chain
+                           testnet --keys-path $HOME/parity/testnet-keys.
+                           Overrides the --keys-path option.
   --datadir PATH           Equivalent to --db-path PATH.
-  --testnet                Equivalent to --chain testnet.
   --networkid INDEX        Equivalent to --network-id INDEX.
   --maxpeers COUNT         Equivalent to --peers COUNT.
   --nodekey KEY            Equivalent to --node-key KEY.
@@ -164,6 +186,7 @@ Legacy Options:
 Miscellaneous Options:
   -l --logging LOGGING     Specify the logging level. Must conform to the same
                            format as RUST_LOG.
+  --no-color               Don't use terminal color codes in output.
   -v --version             Show information about version.
   -h --help                Show this screen.
 "#;
@@ -174,7 +197,10 @@ pub struct Args {
 	pub cmd_account: bool,
 	pub cmd_new: bool,
 	pub cmd_list: bool,
+	pub cmd_export: bool,
+	pub cmd_import: bool,
 	pub arg_pid_file: String,
+	pub arg_file: Option<String>,
 	pub flag_chain: String,
 	pub flag_db_path: String,
 	pub flag_identity: String,
@@ -182,6 +208,8 @@ pub struct Args {
 	pub flag_password: Vec<String>,
 	pub flag_cache: Option<usize>,
 	pub flag_keys_path: String,
+	pub flag_keys_iterations: u32,
+	pub flag_no_import_keys: bool,
 	pub flag_bootnodes: Option<String>,
 	pub flag_network_id: Option<String>,
 	pub flag_pruning: String,
@@ -216,6 +244,11 @@ pub struct Args {
 	pub flag_tx_limit: usize,
 	pub flag_logging: Option<String>,
 	pub flag_version: bool,
+	pub flag_from: String,
+	pub flag_to: String,
+	pub flag_format: Option<String>,
+	pub flag_jitvm: bool,
+	pub flag_no_color: bool,
 	// legacy...
 	pub flag_geth: bool,
 	pub flag_nodekey: Option<String>,
